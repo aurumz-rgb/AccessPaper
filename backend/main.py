@@ -123,28 +123,27 @@ async def on_shutdown():
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For production, restrict this!
+    allow_origins=["https://accesspaper.fly.dev"],  #imp
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Modified stats endpoint to track unique visitor IPs and total visits
+
 @app.get("/api/stats")
 async def api_get_stats():
-    # Return stats without incrementing visits
     return get_stats()
 
 
 @app.get("/api/stats/track")
 async def api_get_stats_with_track(request: Request):
     client_ip = request.client.host
-    track_user_visit(client_ip)  # increments visits and unique users
+    track_user_visit(client_ip) 
     return get_stats()
 
 
 
-# Utility function example
+
 def quote(text: Optional[str]) -> str:
     return url_quote(text or "")
 
@@ -182,7 +181,6 @@ async def reset_stats(request: Request):
 
 
 
-
 async def get_crossref_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     print(f"[Crossref] Fetching metadata for DOI: {doi}")
     url = f"https://api.crossref.org/works/{quote(doi)}"
@@ -209,6 +207,45 @@ async def get_crossref_metadata(doi: str, client: httpx.AsyncClient) -> Optional
     except Exception as e:
         print(f"[Crossref] metadata fetch error: {e}")
         return None
+
+
+
+async def get_pdf_url_from_doi(doi: str, client: httpx.AsyncClient) -> Dict[str, str]:
+    """
+    Returns a dictionary with:
+    - pdf_url: direct PDF link if available
+    - publisher_url: publisher page URL
+    """
+    print(f"[DOI] Fetching for DOI: {doi}", flush=True)
+    doi_url = f"https://doi.org/{doi}"
+    result = {"pdf_url": None, "publisher_url": None}
+
+    try:
+        # Resolve DOI
+        resp = await client.get(doi_url, follow_redirects=True, timeout=REQUEST_TIMEOUT)
+        final_url = str(resp.url)
+        content_type = resp.headers.get("content-type", "").lower()
+
+        if final_url.lower().endswith(".pdf") or "pdf" in content_type:
+            result["pdf_url"] = final_url
+        else:
+            result["publisher_url"] = final_url
+
+        # Optional: handle PMC / arXiv if needed
+        if "arxiv.org" in final_url and "/abs/" in final_url:
+            result["pdf_url"] = final_url.replace("/abs/", "/pdf/") + ".pdf"
+
+    except Exception as e:
+        print(f"[PDF Check] Error checking DOI: {e}", flush=True)
+
+    return result
+
+
+
+
+
+
+
 
 async def get_openalex_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     print(f"[OpenAlex] Fetching metadata for DOI: {doi}")
@@ -908,7 +945,6 @@ async def fetch_pdf_early_cancel(tasks: List[asyncio.Future]) -> Optional[Dict[s
 
 
 
-
 @app.post("/api/search")
 async def search(data: dict):
     doi = data.get("doi")
@@ -917,6 +953,25 @@ async def search(data: dict):
 
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
+
+            # PDF fetchers list (concurrent) – ranked by likelihood
+            pdf_tasks = [
+                get_pdf_url_from_doi(doi, client),
+                get_unpaywall_pdf(doi, client),
+                get_europepmc_pdf(doi, client),
+                get_core_pdf(doi, client),
+                get_base_pdf(doi, client),
+                get_zenodo_pdf(doi, client),
+                get_figshare_pdf(doi, client),
+                get_europepmc_preprints_pdf(doi, client),
+                get_arxiv_pdf(doi, client),
+                get_biorxiv_pdf(doi, client),
+                get_medrxiv_pdf(doi, client),
+                get_internetarchive_pdf(doi, client),
+            ]
+
+            print("Starting PDF fetch tasks with early cancellation")
+            pdf_result = await fetch_pdf_early_cancel(pdf_tasks)
 
             # Metadata fetchers list (concurrent)
             metadata_tasks = [
@@ -956,8 +1011,12 @@ async def search(data: dict):
                         if not metadata and m.get("title"):
                             metadata = m
 
+            # Always return metadata, even if empty
             if metadata is None:
-                raise HTTPException(status_code=404, detail="Metadata not found")
+                metadata = {}
+                no_meta_message = "No metadata found"
+            else:
+                no_meta_message = None
 
             title = metadata.get("title", "Unknown Title")
             authors = metadata.get("authors", [])
@@ -965,45 +1024,23 @@ async def search(data: dict):
             if authors and isinstance(authors, list) and isinstance(authors[0], dict):
                 author_name = authors[0].get("name", "Unknown")
 
-            # PDF fetchers list (concurrent)
-            pdf_tasks = [
-                get_unpaywall_pdf(doi, client),
-                get_core_pdf(doi, client),
-                get_zenodo_pdf(doi, client),
-                get_figshare_pdf(doi, client),
-                get_europepmc_pdf(doi, client),
-                get_base_pdf(doi, client),
-                get_arxiv_pdf(doi, client),
-                get_biorxiv_pdf(doi, client),
-                get_medrxiv_pdf(doi, client),
-                get_internetarchive_pdf(doi, client),
-                get_europepmc_preprints_pdf(doi, client),
-            ]
-
-            if pdf_result_from_meta:
-                # Add immediate result to PDF tasks
-                pdf_tasks.append(asyncio.sleep(0, result=pdf_result_from_meta))
-            
-            print("Starting PDF fetch tasks with early cancellation")
-            pdf_result = await fetch_pdf_early_cancel(pdf_tasks)
+            if pdf_result_from_meta and not pdf_result:
+                pdf_result = pdf_result_from_meta
 
             increment_papers_processed()
 
-
         if pdf_result:
             return {
-                "message": "Paper found!",
+                "message": "Paper found!" if metadata else no_meta_message,
                 "pdf_link": pdf_result["pdf_url"],
-                "host_type": pdf_result["host_type"],
-                "source": pdf_result["source"],
+                "host_type": pdf_result.get("host_type","unknown"),
+                "source": pdf_result.get("source","unknown"),
                 "metadata": metadata,
-  
             }
         else:
             return {
-                "message": "Couldn't find paper.",
+                "message": no_meta_message or "Couldn't find paper.",
                 "metadata": metadata,
-    
             }
 
     except Exception as e:

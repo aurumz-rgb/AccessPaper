@@ -1,21 +1,21 @@
 #!/bin/bash
+# install-all.sh
+# Installs dependencies for both backend and frontend
 
-# ----------------------
-# Install backend (Python)
-# ----------------------
-echo "Installing backend (Python) packages..."
-backend_packages=$(sed -n '/# Backend/,/# Frontend/p' requirements.txt | grep -v '#' | grep -v '^$')
-for pkg in $backend_packages; do
-    python3 -m pip install $pkg
-done
+set -e  # exit on first error
 
-# ----------------------
-# Install frontend (Node.js)
-# ----------------------
-echo "Installing frontend (Node.js) packages..."
-frontend_packages=$(sed -n '/# Frontend/,$p' requirements.txt | grep -v '#' | grep -v '^$')
-for pkg in $frontend_packages; do
-    npm install $pkg
-done
+echo "Installing backend dependencies..."
+cd backend
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+deactivate
+cd ..
 
-echo "✅ All dependencies installed!"
+echo "Installing frontend dependencies..."
+cd frontend
+npm install
+cd ..
+
+echo "All dependencies installed successfully!"

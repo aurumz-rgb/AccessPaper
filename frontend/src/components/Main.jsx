@@ -54,7 +54,7 @@ export default function Main() {
     setLoading(true);
     setResults(null);
     try {
-      const response = await fetch("http://localhost:8000/api/search", {
+      const response = await fetch("https://accesspaper-backend.fly.dev/api/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ doi }),
@@ -93,6 +93,8 @@ export default function Main() {
       role="main"
       aria-label="Access Paper Search"
       style={{
+        position: "relative",
+        zIndex: 2, 
         maxWidth: "650px",
         margin: mode === "results" ? "40px auto" : "80px auto",
         padding: "0 20px 50px 20px",
