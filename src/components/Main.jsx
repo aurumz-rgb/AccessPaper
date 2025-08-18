@@ -19,7 +19,12 @@ function LottieAnimation({ loop = true }) {
   return (
     <div
       ref={containerRef}
-      style={{ width: "100%", height: "300px", maxWidth: 500, margin: "90px auto 0 auto" }}
+      style={{
+        width: "100%",
+        height: "300px",
+        maxWidth: 500,
+        margin: "90px auto 0 auto",
+      }}
     />
   );
 }
@@ -32,8 +37,8 @@ export default function Main() {
   const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState(null);
-  const [logs, setLogs] = useState([]); // <-- NEW: logs state
-  const [showLogs, setShowLogs] = useState(false); // toggle panel
+  const [logs, setLogs] = useState([]);
+  const [showLogs, setShowLogs] = useState(false);
 
   useEffect(() => {
     setDisplayedText(fullText);
@@ -48,8 +53,6 @@ export default function Main() {
     }
     setLoading(true);
     setResults(null);
-    setLogs(["Starting search…"]); // <-- RESET logs
-    setShowLogs(true);
     try {
       const response = await fetch("http://localhost:8000/api/search", {
         method: "POST",
@@ -61,7 +64,6 @@ export default function Main() {
 
       const data = await response.json();
 
-      // <-- If backend sends logs, add them
       if (data.logs && Array.isArray(data.logs)) {
         setLogs(data.logs);
       } else {
@@ -100,7 +102,6 @@ export default function Main() {
     >
       {mode === "input" && (
         <>
-          {/* Lottie animation */}
           <div
             style={{
               height: "180px",
@@ -115,7 +116,6 @@ export default function Main() {
             <LottieAnimation loop={true} />
           </div>
 
-          {/* Title */}
           <h1
             id="fadein-title"
             aria-live="polite"
@@ -150,7 +150,6 @@ export default function Main() {
             Discover research effortlessly. Instant access to papers with one DOI.
           </p>
 
-          {/* Search bar */}
           <div
             id="search-bar"
             style={{
@@ -211,8 +210,7 @@ export default function Main() {
             </button>
           </div>
 
-          {/* Logs panel */}
-          {showLogs && (
+          {showLogs && logs.length > 0 && (
             <div
               style={{
                 marginTop: "10px",
@@ -235,7 +233,6 @@ export default function Main() {
         </>
       )}
 
-      {/* Results Section */}
       {mode === "results" && results && typeof results === "object" && (
         <section
           id="paper-info"
@@ -322,7 +319,6 @@ export default function Main() {
             </p>
           )}
 
-          {/* Back button */}
           <button
             onClick={handleBack}
             type="button"
@@ -350,6 +346,28 @@ export default function Main() {
           </button>
         </section>
       )}
+
+      <style>
+        {`
+        /* Responsiveness */
+        @media (max-width: 700px) {
+          #fadein-title { font-size: 2.5rem !important; }
+          #tagline { font-size: 1rem !important; }
+          #search-bar input { font-size: 0.9rem !important; padding: 12px 14px !important; }
+          #search-bar button { font-size: 0.9rem !important; padding: 12px 18px !important; }
+          #paper-info h2 { font-size: 1.5rem !important; }
+          #paper-info p { font-size: 0.95rem !important; }
+        }
+        @media (max-width: 480px) {
+          #fadein-title { font-size: 2rem !important; }
+          #tagline { font-size: 0.9rem !important; }
+          #search-bar { flex-direction: column; }
+          #search-bar input { width: 100%; border-right: 1px solid #ccc; margin-bottom: 8px; }
+          #search-bar button { width: 100%; }
+          #paper-info { padding: 16px 20px !important; }
+        }
+        `}
+      </style>
     </main>
   );
 }

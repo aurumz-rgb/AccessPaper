@@ -18,11 +18,9 @@ export default function Menu() {
   const [helpOpen, setHelpOpen] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
 
-  // Proper Georgian time conversion for custom UTC strings
   const convertToGeorgianTime = (utcString) => {
     try {
       if (!utcString || utcString === "-") return "-";
-      // Parse "05 Aug 2025, 04:45 UTC"
       const cleaned = utcString.replace(" UTC", "");
       const [datePart, timePart] = cleaned.split(", ");
       if (!datePart || !timePart) return utcString;
@@ -56,7 +54,6 @@ export default function Menu() {
     }
   };
 
-  // This fetches stats AND tracks visit count
   const fetchTrackedStats = async () => {
     try {
       const res = await fetch(`${API_BASE}/api/stats/track`);
@@ -72,7 +69,6 @@ export default function Menu() {
     }
   };
 
-  // Call fetchTrackedStats on component mount to track normal visits
   useEffect(() => {
     fetchTrackedStats();
   }, []);
@@ -83,7 +79,6 @@ export default function Menu() {
       setShowStats(true);
 
       try {
-        // Dev stats fetch: NO tracking, just read stats
         const res = await fetch(`${API_BASE}/api/stats`);
         if (!res.ok) throw new Error("Failed to fetch stats");
         const data = await res.json();
@@ -125,14 +120,12 @@ export default function Menu() {
   return (
     <>
       <div id="menu-container">
-        {/* Hamburger menu */}
         <div id="hamburger" onClick={() => setMenuOpen(!menuOpen)}>
           <span></span>
           <span></span>
           <span></span>
         </div>
 
-        {/* Question mark help toggle, top right corner */}
         <div
           id="help-toggle"
           title="How to use?"
@@ -147,7 +140,6 @@ export default function Menu() {
           ?
         </div>
 
-        {/* Menu options */}
         {menuOpen && (
           <div id="menu-options">
             <a
@@ -242,7 +234,6 @@ export default function Menu() {
               )}
             </div>
 
-            {/* NEW Back button for menu */}
             <button
               style={{
                 marginTop: "12px",
@@ -260,7 +251,6 @@ export default function Menu() {
           </div>
         )}
 
-        {/* Help panel fixed on right below question mark */}
         {helpOpen && (
           <div
             id="menu-options"
@@ -277,22 +267,18 @@ export default function Menu() {
             <h3>How to use?</h3>
             <p>Welcome to AccessPaper! How to get your research articles:</p>
             <p>
-              <ul style={{ paddingLeft: "20px", marginBottom: "4px" }}>
+              <ol style={{ paddingLeft: "20px", marginBottom: "4px" }}>
                 <li style={{ marginBottom: "8px" }}>
-                  1. Enter one or more DOIs into the search box
+                  Enter your paper's DOI into the search box.
                 </li>
                 <li style={{ marginBottom: "8px" }}>
-                  2. AccessPaper will instantly check for free, legal full-text
-                  versions of the paper
+                  AccessPaper will instantly check for free, legal full-text
+                  versions of the paper.
                 </li>
                 <li style={{ marginBottom: "8px" }}>
-                  3. If available, download the article immediately
+                  If available, download the article immediately.
                 </li>
-                <li style={{ marginBottom: "8px" }}>
-                  4. If not found, AccessPaper will automatically send the
-                  Author&apos;s mail to request the paper from.
-                </li>
-              </ul>
+              </ol>
             </p>
             <button
               style={{
@@ -311,7 +297,6 @@ export default function Menu() {
           </div>
         )}
 
-        {/* Info panel similar to Help but on LEFT */}
         {infoOpen && (
           <div
             id="menu-options"
@@ -330,31 +315,21 @@ export default function Menu() {
               To find free articles, AccessPaper searches multiple trusted
               sources including:
             </p>
-            <ul style={{ paddingLeft: "20px", marginBottom: "4px" }}>
-              <li style={{ marginBottom: "8px" }}>
+            <ul style={{ fontSize: "0.9rem",paddingLeft: "20px", marginBottom: "4px" }}>
+              <li style={{ marginBottom: "10px" }}>
                 Open Access repositories through Unpaywall
               </li>
-              <li style={{ marginBottom: "8px" }}>
+              <li style={{ marginBottom: "10px" }}>
                 Preprint servers like arXiv, bioRxiv, and medRxiv
               </li>
-              <li style={{ marginBottom: "8px" }}>
+              <li style={{ marginBottom: "10px" }}>
                 Academic aggregators such as CORE, Zenodo, and Figshare
               </li>
-              <li style={{ marginBottom: "8px" }}>
+              <li style={{ marginBottom: "10px" }}>
                 Funded research archives like PubMed Central and EuropePMC
               </li>
-              <li style={{ marginBottom: "8px" }}>
-                Institutional and personal academic pages via Google Custom
-                Search
-              </li>
             </ul>
-            <p>
-              Use the hamburger menu to explore support and developer options.
-              Developers can log in with a password to view backend statistics
-              via the Developer button.
-            </p>
-            <p>Click the question mark (?) anytime to open this help panel.</p>
-            <p>
+            <p style={{ marginTop: "32px" }}>
               For detailed information, visit our GitHub repository or contact
               support via the Support link.
             </p>
@@ -378,148 +353,47 @@ export default function Menu() {
 
       <style>
         {`
-          /* your existing styles unchanged */
-          #menu-container {
-            position: fixed;
-            top: 20px;
-            left: 20px;
-            z-index: 1200;
+          
+          #menu-container { position: fixed; top: 20px; left: 20px; z-index: 1200; }
+          #hamburger { cursor: pointer; width: 25px; height: 20px; display: flex; flex-direction: column; justify-content: space-between; padding: 6px; border-radius: 6px; }
+          #hamburger span { display: block; height: 4px; background: #333; border-radius: 2px; }
+          #help-toggle { position: fixed; top: 20px; right: 20px; width: 32px; height: 32px; border-radius: 50%; background: #fff; color: #222; font-weight: 700; font-size: 20px; line-height: 32px; text-align: center; cursor: pointer; user-select: none; transition: background-color 0.25s ease, color 0.25s ease; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; border: none; }
+          #help-toggle:hover, #help-toggle:focus { background-color: #e8f0fe; color: #0a66c2; outline: none; }
+          #menu-options { margin-top: 12px; background: #fff; border-radius: 10px; padding: 16px 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.07); width: 220px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; user-select: none; font-weight: 500; position: relative; }
+          #menu-options a, #menu-options button { display: block; width: 100%; padding: 8px 12px; box-sizing: border-box; margin-bottom: 12px; background: none; border: none; text-align: left; cursor: pointer; font-size: 16px; color: #222; text-decoration: none; border-radius: 6px; transition: background-color 0.25s ease, color 0.25s ease; font-weight: 500; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+          .menu-link { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; font-weight: 500; color: #222; padding: 8px 12px; border-radius: 6px; transition: background-color 0.25s ease, color 0.25s ease; text-decoration: none; display: block; box-sizing: border-box; margin-bottom: 12px; }
+          .menu-link:hover { color: #0a66c2; background-color: #e8f0fe; }
+          #menu-options a:first-child, #menu-options button:first-child { margin-top: 0; }
+          #menu-options a:last-child, #menu-options button:last-child { margin-bottom: 0; }
+          #menu-options a:hover, #menu-options button:hover { color: #0a66c2; background-color: #e8f0fe; }
+          #dev-login-form input { width: 100%; padding: 10px 14px; margin-bottom: 10px; box-sizing: border-box; border: 1.5px solid #ccc; border-radius: 8px; font-size: 15px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; transition: border-color 0.25s ease; }
+          #dev-login-form input:focus { outline: none; border-color: #0a66c2; box-shadow: 0 0 6px rgba(10,102,194,0.3); }
+          #dev-stats { font-size: 14px; color: #444; font-weight: 400; line-height: 1.5; }
+          #menu-options h3 { margin-top: 0; margin-bottom: 8px; font-weight: 600; font-size: 18px; color: #222; }
+          #menu-options p { font-size: 14px; line-height: 1.5; color: #444; margin-bottom: 8px; }
+
+          
+          @media (max-width: 768px) {
+            #menu-options { width: 90vw; max-width: 300px; padding: 14px 16px; }
+            #help-toggle { width: 28px; height: 28px; font-size: 18px; line-height: 28px; }
+            #hamburger { width: 22px; height: 18px; }
+            #hamburger span { height: 3px; }
+            #dev-login-form input { font-size: 14px; padding: 8px 12px; }
+            #menu-options h3 { font-size: 16px; }
+            #menu-options p, #dev-stats { font-size: 13px; }
+            #menu-options a, #menu-options button, .menu-link { font-size: 15px; padding: 6px 10px; }
           }
-          #hamburger {
-            cursor: pointer;
-            width: 25px;
-            height: 20px;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-            padding: 6px;
-            border-radius: 6px;
-          }
-          #hamburger span {
-            display: block;
-            height: 4px;
-            background: #333;
-            border-radius: 2px;
-          }
-          #help-toggle {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            width: 32px;
-            height: 32px;
-            border-radius: 50%;
-            background: #fff;
-            color: #222;
-            font-weight: 700;
-            font-size: 20px;
-            line-height: 32px;
-            text-align: center;
-            cursor: pointer;
-            user-select: none;
-            transition: background-color 0.25s ease, color 0.25s ease;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            border: none;
-          }
-          #help-toggle:hover,
-          #help-toggle:focus {
-            background-color: #e8f0fe;
-            color: #0a66c2;
-            outline: none;
-          }
-          #menu-options {
-            margin-top: 12px;
-            background: #fff;
-            border-radius: 10px;
-            padding: 16px 20px;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.07);
-            width: 220px;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            user-select: none;
-            font-weight: 500;
-            position: relative;
-          }
-          #menu-options a,
-          #menu-options button {
-            display: block;
-            width: 100%;
-            padding: 8px 12px;
-            box-sizing: border-box;
-            margin-bottom: 12px;
-            background: none;
-            border: none;
-            text-align: left;
-            cursor: pointer;
-            font-size: 16px;
-            color: #222;
-            text-decoration: none;
-            border-radius: 6px;
-            transition: background-color 0.25s ease, color 0.25s ease;
-            font-weight: 500;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-          }
-          .menu-link {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            font-weight: 500;
-            color: #222;
-            padding: 8px 12px;
-            border-radius: 6px;
-            transition: background-color 0.25s ease, color 0.25s ease;
-            text-decoration: none;
-            display: block;
-            box-sizing: border-box;
-            margin-bottom: 12px;
-          }
-          .menu-link:hover {
-            color: #0a66c2;
-            background-color: #e8f0fe;
-          }
-          #menu-options a:first-child,
-          #menu-options button:first-child {
-            margin-top: 0;
-          }
-          #menu-options a:last-child,
-          #menu-options button:last-child {
-            margin-bottom: 0;
-          }
-          #menu-options a:hover,
-          #menu-options button:hover {
-            color: #0a66c2;
-            background-color: #e8f0fe;
-          }
-          #dev-login-form input {
-            width: 100%;
-            padding: 10px 14px;
-            margin-bottom: 10px;
-            box-sizing: border-box;
-            border: 1.5px solid #ccc;
-            border-radius: 8px;
-            font-size: 15px;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            transition: border-color 0.25s ease;
-          }
-          #dev-login-form input:focus {
-            outline: none;
-            border-color: #0a66c2;
-            box-shadow: 0 0 6px rgba(10, 102, 194, 0.3);
-          }
-          #dev-stats {
-            font-size: 14px;
-            color: #444;
-            font-weight: 400;
-            line-height: 1.5;
-          }
-          #menu-options h3 {
-            margin-top: 0;
-            margin-bottom: 8px;
-            font-weight: 600;
-            font-size: 18px;
-            color: #222;
-          }
-          #menu-options p {
-            font-size: 14px;
-            line-height: 1.5;
-            color: #444;
-            margin-bottom: 8px;
+
+          @media (max-width: 480px) {
+            #menu-container { top: 12px; left: 12px; }
+            #help-toggle { top: 12px; right: 12px; width: 26px; height: 26px; font-size: 16px; line-height: 26px; }
+            #menu-options { width: 95vw; max-width: 260px; padding: 12px 14px; }
+            #hamburger { width: 20px; height: 16px; }
+            #hamburger span { height: 2.5px; }
+            #dev-login-form input { font-size: 13px; padding: 6px 10px; }
+            #menu-options h3 { font-size: 15px; }
+            #menu-options p, #dev-stats { font-size: 12px; }
+            #menu-options a, #menu-options button, .menu-link { font-size: 14px; padding: 5px 8px; }
           }
         `}
       </style>

@@ -21,7 +21,7 @@
     margin: 0;
     padding: 0;
     height: 100%;
-    overflow: hidden; 
+    overflow: hidden; /* Prevent scrolling */
   }
 
   #background {
@@ -32,6 +32,7 @@
     height: 100%;
     z-index: -1;
     filter: blur(1px);
+    object-fit: cover;
   }
 
   #container {
@@ -40,18 +41,23 @@
   }
 
   main {
-    height: calc(100vh - 40px);
+    height: calc(100vh - 40px); /* subtract bottom panel height */
     display: flex;
     justify-content: center;
     align-items: flex-start;
     padding-top: 80px;
     box-sizing: border-box;
+    overflow: hidden; /* Prevent internal scroll */
+    width: 100%;
   }
 
   #hero {
     display: flex;
     flex-direction: column;
     align-items: center;
+    width: 90%;
+    max-width: 1200px;
+    margin: 0 auto;
   }
 
   .logo-placeholder {
@@ -68,6 +74,7 @@
     background: #1e1e1eff;
     color: #ccc;
     padding: 8px 0;
+    z-index: 10;
   }
 
   #bottom-panel .panel-content {
@@ -79,6 +86,8 @@
     align-items: center;
     font-size: 12px;
     position: relative;
+    flex-wrap: wrap;
+    gap: 4px; /* small gap to avoid overflow */
   }
 
   #bottom-panel a {
@@ -101,5 +110,60 @@
     font-size: 12px;
     color: #ccc;
     font-weight: 500;
+  }
+
+  /* RESPONSIVENESS */
+  @media (max-width: 1024px) {
+    main {
+      padding-top: 70px;
+    }
+
+    #bottom-panel .panel-content {
+      font-size: 11px;
+    }
+  }
+
+  @media (max-width: 768px) {
+    main {
+      padding-top: 60px;
+    }
+
+    #bottom-panel .panel-content {
+      font-size: 11px;
+      gap: 3px;
+    }
+
+    .center-link {
+      position: static;
+      transform: none;
+      order: 2;
+      text-align: center;
+      width: 100%;
+    }
+
+    #bottom-panel .panel-content span {
+      flex: 1 1 45%;
+      text-align: center;
+    }
+  }
+
+  @media (max-width: 480px) {
+    main {
+      padding-top: 50px;
+    }
+
+    #bottom-panel .panel-content {
+      flex-direction: column;
+      gap: 2px; /* reduce extra height to prevent scroll */
+    }
+
+    #bottom-panel .panel-content span {
+      flex: 1 1 100%;
+      text-align: center;
+    }
+
+    .center-link {
+      width: 100%;
+    }
   }
 </style>

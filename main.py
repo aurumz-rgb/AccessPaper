@@ -163,20 +163,22 @@ async def reset_stats(request: Request):
     if client_password != dev_password:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    empty_stats = {
-        "total_users": 0,
-        "total_visits": 0,
-        "papers_processed": 0,
-        "last_update": "-",
-        "unique_ips": []
-    }
+    with _lock:
+        # Reset in-memory stats
+        _data.update({
+            "total_users": 0,
+            "total_visits": 0,
+            "papers_processed": 0,
+            "last_update": None,
+        })
+        _unique_ips.clear()
+        _processed_dois.clear()
 
+        # Save using the same schema as save_usage()
+        save_usage()
 
-    # If you are storing stats in a JSON file
-    with open("usage_stats.json", "w") as f:
-        json.dump(empty_stats, f, indent=2)
+        return get_stats()
 
-    return empty_stats
 
 
 
@@ -995,15 +997,13 @@ async def search(data: dict):
                 "host_type": pdf_result["host_type"],
                 "source": pdf_result["source"],
                 "metadata": metadata,
-                "googleScholar": generate_google_scholar_link(title),
-                "researchGate": generate_researchgate_search(author_name),
+  
             }
         else:
             return {
                 "message": "Couldn't find paper.",
                 "metadata": metadata,
-                "googleScholar": generate_google_scholar_link(title),
-                "researchGate": generate_researchgate_search(author_name),
+    
             }
 
     except Exception as e:
