@@ -15,10 +15,10 @@
 
 ## 📸 Screenshots
 
-![Interface](screenshots/screenshot1.png)  
+![Interface](screenshots/Screenshot1.png)  
 *Interface*
 
-![Result](screenshots/screenshot2.png)  
+![Result](screenshots/Screenshot2.png)  
 *Search Result.*
 
 ---
