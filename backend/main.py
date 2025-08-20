@@ -14,8 +14,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-REQUEST_TIMEOUT = 9  # seconds
+REQUEST_TIMEOUT = 7  # seconds
 
+BASE_API_ENABLED = os.getenv("BASE_API_ENABLED","")
 CORE_API_KEY = os.getenv("CORE_API_KEY", "")
 GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY", "")
 UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", "your_email@example.com")
@@ -413,7 +414,7 @@ async def get_europepmc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dic
 
 
 
-BASE_API_ENABLED = False  # Set this globally in your module/config
+BASE_API_ENABLED = True
 
 async def get_base_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     print(f"[BASE] Fetching PDF for DOI: {doi}")
@@ -919,32 +920,6 @@ async def get_share_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
 
 
 
-
-async def fetch_pdf_early_cancel(tasks: List[asyncio.Future]) -> Optional[Dict[str, Any]]:
-    """
-    Run tasks concurrently, return first successful result,
-    and cancel all others.
-    """
-    tasks = [asyncio.create_task(t) for t in tasks]
-
-    try:
-        while tasks:
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                result = task.result()
-                if result:
-                    # Cancel all pending tasks
-                    for p in pending:
-                        p.cancel()
-                    return result
-            tasks = list(pending)
-    except asyncio.CancelledError:
-        pass
-    return None
-
-
-
-
 @app.post("/api/search")
 async def search(data: dict):
     doi = data.get("doi")
@@ -954,7 +929,7 @@ async def search(data: dict):
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
 
-            # PDF fetchers list (concurrent) – ranked by likelihood
+            # PDF fetchers list
             pdf_tasks = [
                 get_pdf_url_from_doi(doi, client),
                 get_unpaywall_pdf(doi, client),
@@ -970,10 +945,7 @@ async def search(data: dict):
                 get_internetarchive_pdf(doi, client),
             ]
 
-            print("Starting PDF fetch tasks with early cancellation")
-            pdf_result = await fetch_pdf_early_cancel(pdf_tasks)
-
-            # Metadata fetchers list (concurrent)
+            # Metadata fetchers list
             metadata_tasks = [
                 get_crossref_metadata(doi, client),
                 get_openalex_metadata(doi, client),
@@ -991,27 +963,80 @@ async def search(data: dict):
                 get_google_books_metadata(doi, client),
             ]
 
-            metadata_results = await asyncio.gather(*metadata_tasks)
+            # Run all tasks in parallel
+            pdf_tasks = [asyncio.create_task(t) for t in pdf_tasks]
+            metadata_tasks = [asyncio.create_task(t) for t in metadata_tasks]
 
-            # Merge metadata, prefer first with title
+            pdf_result = None
             metadata = None
-            pdf_result_from_meta = None
-            for m in metadata_results:
-                if m:
-                    if isinstance(m, dict) and "metadata" in m:
-                        if not metadata and m["metadata"].get("title"):
-                            metadata = m["metadata"]
-                        if m.get("pdf_url") and not pdf_result_from_meta:
-                            pdf_result_from_meta = {
-                                "pdf_url": m["pdf_url"],
-                                "host_type": m.get("host_type"),
-                                "source": m.get("source"),
-                            }
-                    else:
-                        if not metadata and m.get("title"):
-                            metadata = m
 
-            # Always return metadata, even if empty
+            # 1. Wait until *first PDF* is found
+            while pdf_tasks:
+                done, pending = await asyncio.wait(pdf_tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    try:
+                        result = task.result()
+                    except Exception:
+                        result = None
+
+                    if result and result.get("pdf_url"):
+                        pdf_result = result
+                        # cancel other pdf fetchers
+                        for t in pending:
+                            t.cancel()
+                        pdf_tasks = []
+                        break
+
+                pdf_tasks = [t for t in pending if not t.cancelled()]
+
+                if pdf_result:
+                    break
+
+            # 2. If PDF is found → give metadata tasks up to 4s to finish
+            if pdf_result:
+                try:
+                    done, pending = await asyncio.wait(metadata_tasks, timeout=4)
+                    for task in done:
+                        try:
+                            result = task.result()
+                        except Exception:
+                            result = None
+
+                        if result:
+                            # Skip crossref_event results
+                            if result.get("source") == "crossref_event":
+                                continue
+
+                            if isinstance(result, dict) and "metadata" in result:
+                                if result["metadata"].get("title"):
+                                    metadata = result["metadata"]
+                            elif result.get("title"):
+                                metadata = result
+                    # cancel any remaining after 4s
+                    for t in pending:
+                        t.cancel()
+                except asyncio.TimeoutError:
+                    metadata = None
+            else:
+                # If no PDF found at all → still try waiting fully for metadata
+                done, pending = await asyncio.wait(metadata_tasks, timeout=6)
+                for task in done:
+                    try:
+                        result = task.result()
+                    except Exception:
+                        result = None
+                    if result:
+                        if result.get("source") == "crossref_event":
+                            continue
+                        if isinstance(result, dict) and "metadata" in result:
+                            if result["metadata"].get("title"):
+                                metadata = result["metadata"]
+                        elif result.get("title"):
+                            metadata = result
+                for t in pending:
+                    t.cancel()
+
+            # Fallback metadata if nothing found
             if metadata is None:
                 metadata = {}
                 no_meta_message = "No metadata found"
@@ -1024,17 +1049,14 @@ async def search(data: dict):
             if authors and isinstance(authors, list) and isinstance(authors[0], dict):
                 author_name = authors[0].get("name", "Unknown")
 
-            if pdf_result_from_meta and not pdf_result:
-                pdf_result = pdf_result_from_meta
-
             increment_papers_processed()
 
         if pdf_result:
             return {
                 "message": "Paper found!" if metadata else no_meta_message,
                 "pdf_link": pdf_result["pdf_url"],
-                "host_type": pdf_result.get("host_type","unknown"),
-                "source": pdf_result.get("source","unknown"),
+                "host_type": pdf_result.get("host_type", "unknown"),
+                "source": pdf_result.get("source", "unknown"),
                 "metadata": metadata,
             }
         else:
@@ -1044,6 +1066,5 @@ async def search(data: dict):
             }
 
     except Exception as e:
-        # For production, replace prints with logging
         print(f"[Search API Error] {e}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -13,7 +13,7 @@ primary_region = "fra"
   min_machines_running = 1
 
 [[vm]]
-  memory = "1gb"
+  memory = "512mb"
   cpu_kind = "shared"
   cpus = 1
 
