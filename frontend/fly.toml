@@ -1,7 +1,6 @@
-# fly.toml for frontend
-app = "accesspaper"  
+# fly.toml for frontend (IPv4-only)
+app = "accesspaper"
 primary_region = "fra"
-
 
 [env]
   NODE_ENV = "production"
@@ -17,3 +16,7 @@ primary_region = "fra"
   memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
+
+# IPv4-only allocation (disables IPv6)
+[experimental]
+  disable_ipv6 = true
