@@ -1,0 +1,20 @@
+# fly.toml - Backend for AccessPaper
+app = "accesspaper-backend"
+primary_region = "fra"
+
+[build]
+  # Leave empty if using default build from Dockerfile
+  # Or add builder if using buildpacks
+
+[http_service]
+  internal_port = 80            
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
