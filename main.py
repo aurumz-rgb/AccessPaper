@@ -3,40 +3,182 @@ import json
 import asyncio
 from datetime import datetime
 from threading import RLock
-import xml.etree.ElementTree as ET
 from typing import Optional, Dict, Any, List
 from urllib.parse import quote as url_quote
+import xml.etree.ElementTree as ET
+from datetime import date
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
+load_dotenv()
+
+REQUEST_TIMEOUT = 5 # seconds
+
+BASE_API_ENABLED = os.getenv("BASE_API_ENABLED","")
+CORE_API_KEY = os.getenv("CORE_API_KEY", "")
+GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY", "")
+UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", "your_email@example.com")
+
+USAGE_FILE = "usage_stats.json"
+_lock = RLock()
+
+_data = {
+    "total_users": 0,    # cumulative unique visitors by IP
+    "total_visits": 0,   
+    "papers_processed": 0,
+    "last_update": None,
+}
+
+_unique_ips = set()        
+_processed_dois = set()   
+
+
+def load_usage():
+    global _data, _unique_ips
+    try:
+        print("Loading usage data...")
+        with open(USAGE_FILE, "r") as f:
+            saved = json.load(f)
+            _data.update(saved.get("data", {}))
+            _unique_ips.update(saved.get("unique_ips", []))
+        print("Loaded usage data:", _data)
+    except (FileNotFoundError, json.JSONDecodeError):
+        print("Usage file missing or corrupt, creating default...")
+        save_usage()
+        print("Default usage data saved.")
+
+
+def save_usage():
+    print("save_usage called")
+    with _lock:
+        print("save_usage lock acquired")
+        _data["last_update"] = datetime.utcnow().strftime("%d %b %Y, %H:%M UTC")
+        to_save = {
+            "data": _data,
+            "unique_ips": list(_unique_ips),
+        }
+        with open(USAGE_FILE, "w") as f:
+            print(f"Writing to {USAGE_FILE}")
+            json.dump(to_save, f, indent=2)
+        print(f"Finished writing to {USAGE_FILE}")
+
+
+def track_user_visit(ip: str):
+    """Track a unique user by IP, increment total_users if IP is new,
+    and increment total_visits every visit."""
+    if not ip:
+        return
+    with _lock:
+        _data["total_visits"] += 1  # increment for every visit
+        if ip not in _unique_ips:
+            _unique_ips.add(ip)
+            _data["total_users"] += 1
+        save_usage()
+
+
+def increment_papers_processed(doi: Optional[str] = None):
+    with _lock:
+        if doi and doi in _processed_dois:
+            return
+        if doi:
+            _processed_dois.add(doi)
+        _data["papers_processed"] += 1
+        if _data["papers_processed"] < 0:
+            _data["papers_processed"] = 0
+        save_usage()
+
+
+def get_stats() -> Dict:
+    return {
+        "total_users": _data["total_users"],           
+        "total_visits": _data["total_visits"],         
+        "papers_processed": _data["papers_processed"], 
+        "last_update": _data["last_update"],         
+    }
+
+
+def check_and_increment_google_books() -> bool:
+    return True
+
+
+# Load usage at import/startup
+load_usage()
 
 app = FastAPI()
 
-load_dotenv()
+@app.on_event("startup")
+async def on_startup():
+    try:
+        print("App startup")
+    except Exception as e:
+        print(f"Error on startup: {e}")
 
-REQUEST_TIMEOUT = 5  # seconds
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        print("App shutdown")
+    except Exception as e:
+        print(f"Error on shutdown: {e}")
 
-BASE_API_ENABLED = os.getenv("BASE_API_ENABLED", "")
-CORE_API_KEY = os.getenv("CORE_API_KEY", "")
-GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY", "")
-UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://accesspaper.vercel.app"],  #imp
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Crossref / Paper processing tracking
-_lock = RLock()
-_processed_dois = set()
+
+@app.get("/api/stats")
+async def api_get_stats():
+    return get_stats()
+
+
+@app.get("/api/stats/track")
+async def api_get_stats_with_track(request: Request):
+    client_ip = request.client.host
+    track_user_visit(client_ip) 
+    return get_stats()
+
+
 
 
 def quote(text: Optional[str]) -> str:
     return url_quote(text or "")
 
-async def verify_pdf(url: str, client: httpx.AsyncClient) -> bool:
-    try:
-        r = await client.head(url, timeout=REQUEST_TIMEOUT, follow_redirects=True)
-        return r.status_code == 200
-    except Exception:
-        return False
+# Testing increment without server (optional)
+if __name__ == "__main__":
+    increment_papers_processed("10.1000/exampledoi")
+    print("Papers processed incremented to:", _data["papers_processed"])
+
+
+
+@app.post("/api/reset-stats")
+async def reset_stats(request: Request): 
+    dev_password = os.getenv("PUBLIC_DEV_PASSWORD", "")
+    client_password = request.headers.get("x-dev-password")
+
+    if client_password != dev_password:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    with _lock:
+        # Reset in-memory stats
+        _data.update({
+            "total_users": 0,
+            "total_visits": 0,
+            "papers_processed": 0,
+            "last_update": None,
+        })
+        _unique_ips.clear()
+        _processed_dois.clear()
+
+        # Save using the same schema as save_usage()
+        save_usage()
+
+        return get_stats()
+
 
 
 
@@ -80,6 +222,7 @@ async def get_pdf_url_from_doi(doi: str, client: httpx.AsyncClient) -> Dict[str,
     result = {"pdf_url": None, "publisher_url": None}
 
     try:
+        # Resolve DOI
         resp = await client.get(doi_url, follow_redirects=True, timeout=REQUEST_TIMEOUT)
         final_url = str(resp.url)
         content_type = resp.headers.get("content-type", "").lower()
@@ -89,6 +232,7 @@ async def get_pdf_url_from_doi(doi: str, client: httpx.AsyncClient) -> Dict[str,
         else:
             result["publisher_url"] = final_url
 
+        # Optional: handle PMC / arXiv if needed
         if "arxiv.org" in final_url and "/abs/" in final_url:
             result["pdf_url"] = final_url.replace("/abs/", "/pdf/") + ".pdf"
 
@@ -96,6 +240,10 @@ async def get_pdf_url_from_doi(doi: str, client: httpx.AsyncClient) -> Dict[str,
         print(f"[PDF Check] Error checking DOI: {e}", flush=True)
 
     return result
+
+
+
+
 
 
 
@@ -179,7 +327,6 @@ async def get_core_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
         return None
     
     url = f"https://api.core.ac.uk/v3/search/works/?apiKey={CORE_API_KEY}&q=doi:{quote(doi)}"
-
     try:
         r = await client.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
@@ -196,19 +343,13 @@ async def get_core_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
             for url_data in full_text_urls:
                 url_ = url_data.get("url")
                 if url_ and url_.lower().endswith(".pdf"):
-                    # Use the global verify_pdf function
-                    if await verify_pdf(url_, client):
-                        print(f"[CORE] PDF URL verified: {url_}")
-                        return {"pdf_url": url_, "host_type": "CORE", "source": "CORE"}
-                    else:
-                        print(f"[CORE] PDF URL not reachable: {url_}")
+                    print(f"[CORE] PDF URL found: {url_}")
+                    return {"pdf_url": url_, "host_type": "CORE", "source": "CORE"}
         
         print("[CORE] No valid PDF link found in results")
     except Exception as e:
         print(f"[CORE] PDF fetch error: {e}")
     return None
-
-
 
 async def get_zenodo_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     print(f"[Zenodo] Fetching PDF for DOI: {doi}")
@@ -271,6 +412,8 @@ async def get_europepmc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dic
     return None
 
 
+
+
 BASE_API_ENABLED = True
 
 async def get_base_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
@@ -300,6 +443,9 @@ async def get_base_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
         print(f"[BASE] PDF fetch error: {e}")
 
     return None
+
+
+
 
 
 async def get_openaire_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
@@ -927,7 +1073,7 @@ async def search(data: dict):
             if authors and isinstance(authors, list) and isinstance(authors[0], dict):
                 author_name = authors[0].get("name", "Unknown")
 
-            
+            increment_papers_processed()
 
         if pdf_result:
             return {
