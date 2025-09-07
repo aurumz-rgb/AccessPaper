@@ -11,6 +11,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
+
+app = FastAPI()
+
 load_dotenv()
 
 REQUEST_TIMEOUT = 5  # seconds
