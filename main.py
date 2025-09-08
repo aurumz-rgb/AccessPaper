@@ -147,10 +147,6 @@ async def get_pdf_url_from_doi(doi: str, client: httpx.AsyncClient) -> Dict[str,
 
 
 
-
-
-
-
 async def get_openalex_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     print(f"[OpenAlex] Fetching metadata for DOI: {doi}")
     url = f"https://api.openalex.org/works/https://doi.org/{quote(doi)}"
@@ -845,7 +841,6 @@ async def search(data: dict):
                 get_pdf_url_from_doi(doi, client),
                 get_unpaywall_pdf(doi, client),
                 get_europepmc_pdf(doi, client),
-                get_core_pdf(doi, client),
                 get_base_pdf(doi, client),
                 get_zenodo_pdf(doi, client),
                 get_figshare_pdf(doi, client),
@@ -854,6 +849,7 @@ async def search(data: dict):
                 get_biorxiv_pdf(doi, client),
                 get_medrxiv_pdf(doi, client),
                 get_internetarchive_pdf(doi, client),
+                get_core_pdf(doi, client),
             ]
 
             # Metadata fetchers list (may also contain PDF)
@@ -864,15 +860,15 @@ async def search(data: dict):
                 get_openaire_metadata(doi, client),
                 get_openaire_pdf_and_metadata(doi, client),
                 get_doaj_metadata_and_pdf(doi, client),
-                get_plos_pdf_and_metadata(doi, client),
                 get_crossref_event_metadata(doi, client),
                 get_nlm_pubmed_metadata(doi, client),
                 get_dryad_metadata(doi, client),
-                get_core_pdf_and_metadata(doi, client),
                 get_internetarchive_metadata(doi, client),
                 get_europepmc_grants_metadata(doi, client),
                 get_wikidata_metadata(doi, client),
                 get_google_books_metadata(doi, client),
+                get_core_pdf_and_metadata(doi, client),
+                get_plos_pdf_and_metadata(doi, client),
             ]
 
             # Create asyncio tasks
