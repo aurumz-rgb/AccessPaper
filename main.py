@@ -16,95 +16,17 @@ load_dotenv()
 
 REQUEST_TIMEOUT = 5 # seconds
 
-BASE_API_ENABLED = os.getenv("BASE_API_ENABLED","")
+BASE_API_ENABLED = os.getenv("BASE_API_ENABLED") 
 CORE_API_KEY = os.getenv("CORE_API_KEY", "")
 GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY", "")
-UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", "your_email@example.com")
+UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", "email@example.com")
 
-USAGE_FILE = "usage_stats.json"
-_lock = RLock()
-
-_data = {
-    "total_users": 0,    # cumulative unique visitors by IP
-    "total_visits": 0,   
-    "papers_processed": 0,
-    "last_update": None,
-}
-
-_unique_ips = set()        
-_processed_dois = set()   
-
-
-def load_usage():
-    global _data, _unique_ips
-    try:
-        print("Loading usage data...")
-        with open(USAGE_FILE, "r") as f:
-            saved = json.load(f)
-            _data.update(saved.get("data", {}))
-            _unique_ips.update(saved.get("unique_ips", []))
-        print("Loaded usage data:", _data)
-    except (FileNotFoundError, json.JSONDecodeError):
-        print("Usage file missing or corrupt, creating default...")
-        save_usage()
-        print("Default usage data saved.")
-
-
-def save_usage():
-    print("save_usage called")
-    with _lock:
-        print("save_usage lock acquired")
-        _data["last_update"] = datetime.utcnow().strftime("%d %b %Y, %H:%M UTC")
-        to_save = {
-            "data": _data,
-            "unique_ips": list(_unique_ips),
-        }
-        with open(USAGE_FILE, "w") as f:
-            print(f"Writing to {USAGE_FILE}")
-            json.dump(to_save, f, indent=2)
-        print(f"Finished writing to {USAGE_FILE}")
-
-
-def track_user_visit(ip: str):
-    """Track a unique user by IP, increment total_users if IP is new,
-    and increment total_visits every visit."""
-    if not ip:
-        return
-    with _lock:
-        _data["total_visits"] += 1  # increment for every visit
-        if ip not in _unique_ips:
-            _unique_ips.add(ip)
-            _data["total_users"] += 1
-        save_usage()
-
-
-def increment_papers_processed(doi: Optional[str] = None):
-    with _lock:
-        if doi and doi in _processed_dois:
-            return
-        if doi:
-            _processed_dois.add(doi)
-        _data["papers_processed"] += 1
-        if _data["papers_processed"] < 0:
-            _data["papers_processed"] = 0
-        save_usage()
-
-
-def get_stats() -> Dict:
-    return {
-        "total_users": _data["total_users"],           
-        "total_visits": _data["total_visits"],         
-        "papers_processed": _data["papers_processed"], 
-        "last_update": _data["last_update"],         
-    }
-
+ 
 
 def check_and_increment_google_books() -> bool:
     return True
 
 
-# Load usage at import/startup
-load_usage()
 
 app = FastAPI()
 
@@ -131,53 +53,34 @@ app.add_middleware(
 )
 
 
-@app.get("/api/stats")
-async def api_get_stats():
-    return get_stats()
+def merge_metadata(base: dict, new: dict) -> dict:
+    """
+    Merge new metadata into base, preferring non-empty values.
+    Authors are merged uniquely.
+    """
+    if not base:
+        return new or {}
+    if not new:
+        return base
 
+    # Merge simple fields
+    for key, val in new.items():
+        if val and not base.get(key):
+            base[key] = val
 
-@app.get("/api/stats/track")
-async def api_get_stats_with_track(request: Request):
-    client_ip = request.client.host
-    track_user_visit(client_ip) 
-    return get_stats()
+    # Merge authors (avoid duplicates by name)
+    if "authors" in new and new["authors"]:
+        existing_names = {a.get("name") for a in base.get("authors", []) if a.get("name")}
+        for author in new["authors"]:
+            if author.get("name") not in existing_names:
+                base.setdefault("authors", []).append(author)
 
+    return base
 
 
 
 def quote(text: Optional[str]) -> str:
     return url_quote(text or "")
-
-# Testing increment without server (optional)
-if __name__ == "__main__":
-    increment_papers_processed("10.1000/exampledoi")
-    print("Papers processed incremented to:", _data["papers_processed"])
-
-
-
-@app.post("/api/reset-stats")
-async def reset_stats(request: Request): 
-    dev_password = os.getenv("PUBLIC_DEV_PASSWORD", "")
-    client_password = request.headers.get("x-dev-password")
-
-    if client_password != dev_password:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
-    with _lock:
-        # Reset in-memory stats
-        _data.update({
-            "total_users": 0,
-            "total_visits": 0,
-            "papers_processed": 0,
-            "last_update": None,
-        })
-        _unique_ips.clear()
-        _processed_dois.clear()
-
-        # Save using the same schema as save_usage()
-        save_usage()
-
-        return get_stats()
 
 
 
@@ -389,61 +292,53 @@ async def get_figshare_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict
         print(f"[Figshare] PDF fetch error: {e}")
     return None
 
-async def get_europepmc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[EuropePMC] Fetching PDF for DOI: {doi}")
-    url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:{quote(doi)}&format=json"
+async def get_europepmc_preprints_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    print(f"[EuropePMC Preprints] Fetching PDF for DOI: {doi}")
+    url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=doi:{quote(doi)}&format=json"
     try:
         r = await client.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         results = r.json().get("resultList", {}).get("result", [])
         for result in results:
+            if result.get("pubType", "").lower() != "preprint":
+                continue
             full_text_urls = result.get("fullTextUrlList", {}).get("fullTextUrl", [])
             for full_text_url in full_text_urls:
-                if (
-                    full_text_url.get("documentStyle") == "pdf"
-                    and full_text_url.get("availability") == "OPEN_ACCESS"
-                ):
+                if full_text_url.get("documentStyle") == "pdf" and full_text_url.get("availability") == "OPEN_ACCESS":
                     pdf_link = full_text_url.get("url")
-                    print(f"[EuropePMC] PDF URL found: {pdf_link}")
-                    return {"pdf_url": pdf_link, "host_type": "EuropePMC", "source": "EuropePMC"}
-        print("[EuropePMC] No valid PDF link found")
+                    print(f"[EuropePMC Preprints] PDF URL found: {pdf_link}")
+                    return {"pdf_url": pdf_link, "host_type": "EuropePMC Preprints", "source": "EuropePMC Preprints"}
+        print("[EuropePMC Preprints] No valid PDF link found")
     except Exception as e:
-        print(f"[EuropePMC] PDF fetch error: {e}")
+        print(f"[EuropePMC Preprints] PDF fetch error: {e}")
     return None
 
 
 
-
-BASE_API_ENABLED = True
-
 async def get_base_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     print(f"[BASE] Fetching PDF for DOI: {doi}")
-    if not BASE_API_ENABLED:
-        print("[BASE] Skipped: API access not enabled (IP not whitelisted)")
-        return None
 
-    url = (
-        f"https://api.base-search.net/cgi-bin/BaseAPI.dll?"
-        f"operation=searchRetrieve&query=doi={quote(doi)}&maximumRecords=1&recordSchema=dc"
-    )
+    url = f"https://api.base-search.net/beta/search?q=doi:{quote(doi)}&format=json&limit=1"
+    headers = {"Authorization": f"Bearer {BASE_API_ENABLED}"}
+
     try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT, follow_redirects=True)
+        r = await client.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
+        data = await r.json()  # await here!
 
-        root = ET.fromstring(r.content)
-        ns = {"dc": "http://purl.org/dc/elements/1.1/"}
-
-        for elem in root.iterfind(".//dc:identifier", ns):
-            if elem.text and elem.text.lower().endswith(".pdf"):
-                print(f"[BASE] PDF URL found: {elem.text}")
-                return {"pdf_url": elem.text, "host_type": "BASE", "source": "BASE"}
+        records = data.get("records", [])
+        for record in records:
+            for link in record.get("links", []):
+                url_link = link.get("url", "")
+                if link.get("type") == "fulltext" and ".pdf" in url_link.lower(): 
+                    print(f"[BASE] PDF URL found: {url_link}")
+                    return {"pdf_url": url_link, "host_type": "BASE", "source": "BASE"}
 
         print("[BASE] No valid PDF link found in response")
     except Exception as e:
         print(f"[BASE] PDF fetch error: {e}")
 
     return None
-
 
 
 
@@ -533,14 +428,15 @@ async def get_arxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
         print(f"[ArXiv] PDF fetch error: {e}")
     return None
 
-# 4. bioRxiv PDF fetch via unofficial API (RSS feed)
+# 4. bioRxiv PDF fetch via direct content link
 async def get_biorxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     # bioRxiv DOIs have prefix 10.1101
     if not doi.startswith("10.1101"):
         print("[bioRxiv] DOI not bioRxiv prefix, skipping")
         return None
-    # Construct URL to try PDF
-    pdf_url = doi.replace("doi.org", "biorxiv.org/content") + ".full.pdf"
+
+    pdf_url = f"https://www.biorxiv.org/content/{doi}.full.pdf"
+
     try:
         r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
@@ -552,12 +448,15 @@ async def get_biorxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[
         print(f"[bioRxiv] PDF fetch error: {e}")
     return None
 
-# 5. medRxiv PDF fetch (same logic as bioRxiv)
+
+# 5. medRxiv PDF fetch via direct content link
 async def get_medrxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     if not doi.startswith("10.1101"):
         print("[medRxiv] DOI not medRxiv prefix, skipping")
         return None
-    pdf_url = doi.replace("doi.org", "medrxiv.org/content") + ".full.pdf"
+
+    pdf_url = f"https://www.medrxiv.org/content/{doi}.full.pdf"
+
     try:
         r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
@@ -568,6 +467,9 @@ async def get_medrxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[
     except Exception as e:
         print(f"[medRxiv] PDF fetch error: {e}")
     return None
+
+
+
 
 # 6. Internet Archive PDF fetch (search metadata + check for pdf)
 async def get_internetarchive_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
@@ -770,7 +672,7 @@ async def get_internetarchive_metadata(doi: str, client: httpx.AsyncClient) -> O
 # 8. Europe PMC Grants (no key) — typically metadata only
 async def get_europepmc_grants_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     print(f"[Europe PMC Grants] Fetching metadata for DOI: {doi}")
-    url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:{quote(doi)}+AND+grants&format=json"
+    url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={quote(doi)}&format=json"
     try:
         r = await client.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
@@ -779,13 +681,19 @@ async def get_europepmc_grants_metadata(doi: str, client: httpx.AsyncClient) -> 
         if not results:
             print("[Europe PMC Grants] No results found")
             return None
-        item = results[0]
+
+        # pick the first grant-related or general entry
+        item = next((res for res in results if res.get("pubType") == "Grant"), results[0])
+
         metadata = {
             "title": item.get("title"),
-            "authors": [{"name": a} for a in item.get("authorString", "").split(", ")],
+            "authors": [{"name": a} for a in item.get("authorString", "").split(", ") if a],
+            "pubType": item.get("pubType"),
+            "source": "EuropePMC-Grants"
         }
         print(f"[Europe PMC Grants] Metadata fetched: {metadata}")
         return metadata
+
     except Exception as e:
         print(f"[Europe PMC Grants] Fetch error: {e}")
         return None
@@ -851,28 +759,33 @@ async def get_google_books_metadata(doi: str, client: httpx.AsyncClient) -> Opti
         return None
 
 
-# --- Your existing new PDF fetchers from question ---
-async def get_europepmc_preprints_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[EuropePMC Preprints] Fetching PDF for DOI: {doi}")
-    url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:{quote(doi)}+AND+PUB_TYPE:preprint&format=json"
+# --- Modified EuropePMC PDF fetcher ---
+async def get_europepmc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    print(f"[EuropePMC] Fetching PDF for DOI: {doi}")
+    url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=doi:{quote(doi)}&format=json"
     try:
         r = await client.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         results = r.json().get("resultList", {}).get("result", [])
+
         for result in results:
             full_text_urls = result.get("fullTextUrlList", {}).get("fullTextUrl", [])
             for full_text_url in full_text_urls:
-                if (
-                    full_text_url.get("documentStyle") == "pdf"
-                    and full_text_url.get("availability") == "OPEN_ACCESS"
-                ):
+                if full_text_url.get("documentStyle") == "pdf" and full_text_url.get("availability") == "OPEN_ACCESS":
                     pdf_link = full_text_url.get("url")
-                    print(f"[EuropePMC Preprints] PDF URL found: {pdf_link}")
-                    return {"pdf_url": pdf_link, "host_type": "EuropePMC Preprints", "source": "EuropePMC Preprints"}
-        print("[EuropePMC Preprints] No valid PDF link found")
+                    host_type = (
+                        "EuropePMC Preprints"
+                        if result.get("pubType", "").lower() == "preprint"
+                        else "EuropePMC"
+                    )
+                    print(f"[EuropePMC] PDF URL found: {pdf_link} (Type: {host_type})")
+                    return {"pdf_url": pdf_link, "host_type": host_type, "source": host_type}
+
+        print("[EuropePMC] No valid PDF link found")
     except Exception as e:
-        print(f"[EuropePMC Preprints] PDF fetch error: {e}")
+        print(f"[EuropePMC] PDF fetch error: {e}")
     return None
+
 
 
 
@@ -918,7 +831,6 @@ async def get_share_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
         print(f"[Share API] PDF fetch error: {e}")
     return None
 
-
 @app.post("/api/search")
 async def search(data: dict):
     doi = data.get("doi")
@@ -950,6 +862,7 @@ async def search(data: dict):
                 get_openalex_metadata(doi, client),
                 get_semantic_scholar_metadata(doi, client),
                 get_openaire_metadata(doi, client),
+                get_openaire_pdf_and_metadata(doi, client),
                 get_doaj_metadata_and_pdf(doi, client),
                 get_plos_pdf_and_metadata(doi, client),
                 get_crossref_event_metadata(doi, client),
@@ -1004,10 +917,9 @@ async def search(data: dict):
                             if result.get("source") == "crossref_event":
                                 continue
 
-                            # Merge metadata if not set
+                            # Merge metadata
                             if isinstance(result, dict) and "metadata" in result:
-                                if result["metadata"].get("title") and not metadata:
-                                    metadata = result["metadata"]
+                                metadata = merge_metadata(metadata, result["metadata"])
                                 # Merge PDF from metadata only if no independent PDF
                                 if result.get("pdf_url") and not pdf_result.get("independent"):
                                     pdf_result = {
@@ -1039,8 +951,7 @@ async def search(data: dict):
                         result = None
                     if result and result.get("source") != "crossref_event":
                         if isinstance(result, dict) and "metadata" in result:
-                            if result["metadata"].get("title") and not metadata:
-                                metadata = result["metadata"]
+                            metadata = merge_metadata(metadata, result["metadata"])
                             if result.get("pdf_url") and not pdf_result:
                                 pdf_result = {
                                     "pdf_url": result["pdf_url"],
@@ -1073,7 +984,6 @@ async def search(data: dict):
             if authors and isinstance(authors, list) and isinstance(authors[0], dict):
                 author_name = authors[0].get("name", "Unknown")
 
-            increment_papers_processed()
 
         if pdf_result:
             return {
