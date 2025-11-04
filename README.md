@@ -77,11 +77,13 @@ This project has been cited just for future reference and for maintaining an Arc
 
 ---
 
-📄 License  
+## 📄 License  
+
 This project is licensed under the **Apache 2.0 License**.  
 
 ---
 
-📬 Support
+## 📬 Support
+
 For questions, feedback, or collaboration ideas, reach out at **[pteroisvolitans12@gmail.com](mailto:pteroisvolitans12@gmail.com)** or open an issue on GitHub. Contributions are always welcome!  
 
