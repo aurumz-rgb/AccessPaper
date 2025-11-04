@@ -19,17 +19,16 @@ import gc
 
 load_dotenv()
 
-REQUEST_TIMEOUT = 5  # seconds
-MAX_CONCURRENT_REQUESTS = 10  # Limit concurrent requests to reduce RAM usage
-RATE_LIMIT_DELAY = 0.5  # Delay between requests to respect API rates
+REQUEST_TIMEOUT = 5
+MAX_CONCURRENT_REQUESTS = 10
+RATE_LIMIT_DELAY = 0.5
 
 BASE_API_ENABLED = os.getenv("BASE_API_ENABLED") 
 GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY", "")
 UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", "email@example.com")
 
-# Rate limiting for different APIs
 API_RATE_LIMITS = {
-    "crossref": 1.0,  # seconds between requests
+    "crossref": 1.0,
     "openalex": 1.0,
     "semantic_scholar": 1.0,
     "unpaywall": 1.0,
@@ -78,7 +77,6 @@ API_RATE_LIMITS = {
     "pmc": 1.0,
 }
 
-# Last request time for each API
 last_request_time = {api: 0 for api in API_RATE_LIMITS}
 
 app = FastAPI()
@@ -87,7 +85,6 @@ app = FastAPI()
 async def on_startup():
     try:
         print("App startup")
-        # Set up connection pool to reduce overhead
         app.state.client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=MAX_CONCURRENT_REQUESTS),
             timeout=REQUEST_TIMEOUT,
@@ -100,7 +97,6 @@ async def on_startup():
 async def on_shutdown():
     try:
         print("App shutdown")
-        # Clean up resources
         await app.state.client.aclose()
     except Exception as e:
         print(f"Error on shutdown: {e}")
@@ -114,21 +110,15 @@ app.add_middleware(
 )
 
 def merge_metadata(base: dict, new: dict) -> dict:
-    """
-    Merge new metadata into base, preferring non-empty values.
-    Authors are merged uniquely.
-    """
     if not base:
         return new or {}
     if not new:
         return base
 
-    # Merge simple fields
     for key, val in new.items():
         if val and not base.get(key):
             base[key] = val
 
-    # Merge authors (avoid duplicates by name)
     if "authors" in new and new["authors"]:
         existing_names = {a.get("name") for a in base.get("authors", []) if a.get("name")}
         for author in new["authors"]:
@@ -141,7 +131,6 @@ def quote(text: Optional[str]) -> str:
     return url_quote(text or "")
 
 async def rate_limit(api_name: str):
-    """Implement rate limiting for API calls"""
     current_time = time.time()
     last_time = last_request_time.get(api_name, 0)
     time_since_last = current_time - last_time
@@ -152,15 +141,11 @@ async def rate_limit(api_name: str):
     last_request_time[api_name] = time.time()
 
 async def verify_pdf_url(url: str, client: httpx.AsyncClient) -> bool:
-    """
-    Verify that a URL is a direct PDF download link
-    """
     try:
         head_response = await client.head(url, timeout=REQUEST_TIMEOUT)
         content_type = head_response.headers.get("content-type", "").lower()
         content_disposition = head_response.headers.get("content-disposition", "").lower()
         
-        # Check if it's a PDF by content type or content disposition
         if "pdf" in content_type or "pdf" in content_disposition or url.lower().endswith(".pdf"):
             return True
         return False
@@ -168,14 +153,10 @@ async def verify_pdf_url(url: str, client: httpx.AsyncClient) -> bool:
         return False
 
 async def extract_pdf_from_page(page_url: str, client: httpx.AsyncClient) -> Optional[str]:
-    """
-    Try to extract a direct PDF link from a web page
-    """
     try:
         response = await client.get(page_url, timeout=REQUEST_TIMEOUT)
         content = response.text
         
-        # Common patterns for PDF links
         patterns = [
             r'href=["\']([^"\']*\.pdf)["\']',
             r'["\']([^"\']*\.pdf)["\']',
@@ -187,15 +168,12 @@ async def extract_pdf_from_page(page_url: str, client: httpx.AsyncClient) -> Opt
             matches = re.findall(pattern, content, re.IGNORECASE)
             for match in matches:
                 if match.startswith("/"):
-                    # Convert relative URL to absolute
                     base_url = page_url.split("/")[0] + "//" + page_url.split("/")[2]
                     match = base_url + match
                 elif not match.startswith("http"):
-                    # Convert relative URL to absolute
                     base_url = page_url.rsplit("/", 1)[0]
                     match = base_url + "/" + match
                 
-                # Verify it's a PDF
                 if await verify_pdf_url(match, client):
                     return match
         
@@ -203,7 +181,6 @@ async def extract_pdf_from_page(page_url: str, client: httpx.AsyncClient) -> Opt
     except Exception:
         return None
 
-# Metadata fetchers
 async def get_crossref_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("crossref")
     print(f"[Crossref] Fetching metadata for DOI: {doi}")
@@ -452,25 +429,17 @@ async def get_google_books_metadata(doi: str, client: httpx.AsyncClient) -> Opti
         print(f"[Google Books] Fetch error: {e}")
         return None
 
-# PDF fetchers
 async def get_pdf_url_from_doi(doi: str, client: httpx.AsyncClient) -> Dict[str, str]:
-    """
-    Returns a dictionary with:
-    - pdf_url: direct PDF link if available
-    - publisher_url: publisher page URL
-    """
     print(f"[DOI] Fetching for DOI: {doi}", flush=True)
     doi_url = f"https://doi.org/{doi}"
     result = {"pdf_url": None, "publisher_url": None}
 
     try:
-        # Resolve DOI
         resp = await client.get(doi_url, follow_redirects=True, timeout=REQUEST_TIMEOUT)
         final_url = str(resp.url)
         content_type = resp.headers.get("content-type", "").lower()
 
         if final_url.lower().endswith(".pdf") or "pdf" in content_type:
-            # Verify it's a direct PDF
             if await verify_pdf_url(final_url, client):
                 result["pdf_url"] = final_url
             else:
@@ -478,13 +447,11 @@ async def get_pdf_url_from_doi(doi: str, client: httpx.AsyncClient) -> Dict[str,
         else:
             result["publisher_url"] = final_url
 
-        # Optional: handle PMC / arXiv if needed
         if "arxiv.org" in final_url and "/abs/" in final_url:
             pdf_url = final_url.replace("/abs/", "/pdf/") + ".pdf"
             if await verify_pdf_url(pdf_url, client):
                 result["pdf_url"] = pdf_url
         
-        # Try to extract PDF from publisher page if no direct PDF found
         if not result["pdf_url"] and result["publisher_url"]:
             pdf_url = await extract_pdf_from_page(result["publisher_url"], client)
             if pdf_url:
@@ -504,7 +471,6 @@ async def get_unpaywall_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dic
         r.raise_for_status()
         data = r.json()
         
-        # First try best_oa_location
         loc = data.get("best_oa_location")
         if loc:
             pdf_url = loc.get("url_for_pdf")
@@ -512,13 +478,11 @@ async def get_unpaywall_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dic
                 print(f"[Unpaywall] PDF URL found in best_oa_location: {pdf_url}")
                 return {"pdf_url": pdf_url, "host_type": loc.get("host_type"), "source": "Unpaywall"}
             elif pdf_url:
-                # Try to extract PDF from the page
                 direct_pdf = await extract_pdf_from_page(pdf_url, client)
                 if direct_pdf:
                     print(f"[Unpaywall] Direct PDF extracted from page: {direct_pdf}")
                     return {"pdf_url": direct_pdf, "host_type": loc.get("host_type"), "source": "Unpaywall"}
 
-        # If best_oa_location missing or no pdf_url, check all oa_locations
         oa_locations = data.get("oa_locations", [])
         for location in oa_locations:
             pdf_url = location.get("url_for_pdf")
@@ -526,7 +490,6 @@ async def get_unpaywall_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dic
                 print(f"[Unpaywall] PDF URL found in oa_locations: {pdf_url}")
                 return {"pdf_url": pdf_url, "host_type": location.get("host_type"), "source": "Unpaywall"}
             elif pdf_url:
-                # Try to extract PDF from the page
                 direct_pdf = await extract_pdf_from_page(pdf_url, client)
                 if direct_pdf:
                     print(f"[Unpaywall] Direct PDF extracted from page: {direct_pdf}")
@@ -560,7 +523,6 @@ async def get_europepmc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dic
                         print(f"[EuropePMC] PDF URL found: {pdf_link} (Type: {host_type})")
                         return {"pdf_url": pdf_link, "host_type": host_type, "source": host_type}
                     else:
-                        # Try to extract PDF from the page
                         direct_pdf = await extract_pdf_from_page(pdf_link, client)
                         if direct_pdf:
                             host_type = (
@@ -586,7 +548,7 @@ async def get_base_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
     try:
         r = await client.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
-        data = r.json()  # Fixed: removed await here
+        data = r.json()
 
         records = data.get("records", [])
         for record in records:
@@ -597,7 +559,6 @@ async def get_base_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
                         print(f"[BASE] PDF URL found: {url_link}")
                         return {"pdf_url": url_link, "host_type": "BASE", "source": "BASE"}
                     else:
-                        # Try to extract PDF from the page
                         direct_pdf = await extract_pdf_from_page(url_link, client)
                         if direct_pdf:
                             print(f"[BASE] Direct PDF extracted from page: {direct_pdf}")
@@ -655,8 +616,6 @@ async def get_figshare_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict
 
 async def get_arxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("arxiv")
-    # DOI for ArXiv papers usually start with "10.48550/arXiv."
-    # Extract arXiv id from DOI if possible
     arxiv_prefix = "10.48550/arXiv."
     if not doi.startswith(arxiv_prefix):
         print("[ArXiv] DOI not arXiv prefix, skipping")
@@ -664,7 +623,6 @@ async def get_arxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
     arxiv_id = doi[len(arxiv_prefix):]
     pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
     try:
-        # Check if PDF exists
         r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             print(f"[ArXiv] PDF URL found: {pdf_url}")
@@ -677,7 +635,6 @@ async def get_arxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
 
 async def get_biorxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("biorxiv")
-    # bioRxiv DOIs have prefix 10.1101
     if not doi.startswith("10.1101"):
         print("[bioRxiv] DOI not bioRxiv prefix, skipping")
         return None
@@ -716,7 +673,6 @@ async def get_medrxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[
 
 async def get_chemrxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("chemrxiv")
-    # ChemRxiv DOIs have prefix 10.26434
     if not doi.startswith("10.26434"):
         print("[ChemRxiv] DOI not ChemRxiv prefix, skipping")
         return None
@@ -736,7 +692,6 @@ async def get_chemrxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict
 
 async def get_f1000_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("f1000")
-    # F1000Research DOIs have prefix 10.12688
     if not doi.startswith("10.12688"):
         print("[F1000] DOI not F1000 prefix, skipping")
         return None
@@ -756,7 +711,6 @@ async def get_f1000_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
 
 async def get_elife_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("elife")
-    # eLife DOIs have prefix 10.7554
     if not doi.startswith("10.7554"):
         print("[eLife] DOI not eLife prefix, skipping")
         return None
@@ -776,7 +730,6 @@ async def get_elife_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
 
 async def get_cell_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("cell")
-    # Cell Press DOIs have prefix 10.1016
     if not doi.startswith("10.1016"):
         print("[Cell] DOI not Cell Press prefix, skipping")
         return None
@@ -796,7 +749,6 @@ async def get_cell_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
 
 async def get_frontiers_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("frontiers")
-    # Frontiers DOIs have prefix 10.3389
     if not doi.startswith("10.3389"):
         print("[Frontiers] DOI not Frontiers prefix, skipping")
         return None
@@ -816,7 +768,6 @@ async def get_frontiers_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dic
 
 async def get_mdpi_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("mdpi")
-    # MDPI DOIs have prefix 10.3390
     if not doi.startswith("10.3390"):
         print("[MDPI] DOI not MDPI prefix, skipping")
         return None
@@ -836,7 +787,6 @@ async def get_mdpi_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
 
 async def get_hindawi_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("hindawi")
-    # Hindawi DOIs have prefix 10.1155
     if not doi.startswith("10.1155"):
         print("[Hindawi] DOI not Hindawi prefix, skipping")
         return None
@@ -856,7 +806,6 @@ async def get_hindawi_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[
 
 async def get_copernicus_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("copernicus")
-    # Copernicus DOIs have prefix 10.5194
     if not doi.startswith("10.5194"):
         print("[Copernicus] DOI not Copernicus prefix, skipping")
         return None
@@ -876,7 +825,6 @@ async def get_copernicus_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Di
 
 async def get_iop_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("iop")
-    # IOP DOIs have prefix 10.1088
     if not doi.startswith("10.1088"):
         print("[IOP] DOI not IOP prefix, skipping")
         return None
@@ -896,7 +844,6 @@ async def get_iop_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str,
 
 async def get_aps_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("aps")
-    # APS DOIs have prefix 10.1103
     if not doi.startswith("10.1103"):
         print("[APS] DOI not APS prefix, skipping")
         return None
@@ -916,7 +863,6 @@ async def get_aps_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str,
 
 async def get_aip_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("aip")
-    # AIP DOIs have prefix 10.1063
     if not doi.startswith("10.1063"):
         print("[AIP] DOI not AIP prefix, skipping")
         return None
@@ -936,7 +882,6 @@ async def get_aip_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str,
 
 async def get_rsc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("rsc")
-    # RSC DOIs have prefix 10.1039
     if not doi.startswith("10.1039"):
         print("[RSC] DOI not RSC prefix, skipping")
         return None
@@ -956,7 +901,6 @@ async def get_rsc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str,
 
 async def get_acs_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("acs")
-    # ACS DOIs have prefix 10.1021
     if not doi.startswith("10.1021"):
         print("[ACS] DOI not ACS prefix, skipping")
         return None
@@ -976,7 +920,6 @@ async def get_acs_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str,
 
 async def get_ieee_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("ieee")
-    # IEEE DOIs have prefix 10.1109
     if not doi.startswith("10.1109"):
         print("[IEEE] DOI not IEEE prefix, skipping")
         return None
@@ -996,7 +939,6 @@ async def get_ieee_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
 
 async def get_acm_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("acm")
-    # ACM DOIs have prefix 10.1145
     if not doi.startswith("10.1145"):
         print("[ACM] DOI not ACM prefix, skipping")
         return None
@@ -1019,13 +961,11 @@ async def get_springer_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict
     print(f"[Springer] Fetching PDF for DOI: {doi}")
     url = f"https://link.springer.com/content/pdf/{quote(doi)}.pdf"
     try:
-        # Check if PDF exists
         r = await client.head(url, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             print(f"[Springer] PDF URL found: {url}")
             return {"pdf_url": url, "host_type": "Springer", "source": "Springer"}
         else:
-            # Try to extract PDF from the article page
             article_url = f"https://link.springer.com/article/{quote(doi)}"
             direct_pdf = await extract_pdf_from_page(article_url, client)
             if direct_pdf:
@@ -1042,7 +982,6 @@ async def get_elsevier_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict
     print(f"[Elsevier] Fetching PDF for DOI: {doi}")
     url = f"https://www.sciencedirect.com/science/article/pii/{quote(doi)}"
     try:
-        # Try to extract PDF from the article page
         direct_pdf = await extract_pdf_from_page(url, client)
         if direct_pdf:
             print(f"[Elsevier] Direct PDF extracted from page: {direct_pdf}")
@@ -1058,13 +997,11 @@ async def get_wiley_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
     print(f"[Wiley] Fetching PDF for DOI: {doi}")
     url = f"https://onlinelibrary.wiley.com/doi/pdfdirect/{quote(doi)}"
     try:
-        # Check if PDF exists
         r = await client.head(url, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             print(f"[Wiley] PDF URL found: {url}")
             return {"pdf_url": url, "host_type": "Wiley", "source": "Wiley"}
         else:
-            # Try to extract PDF from the article page
             article_url = f"https://onlinelibrary.wiley.com/doi/{quote(doi)}"
             direct_pdf = await extract_pdf_from_page(article_url, client)
             if direct_pdf:
@@ -1081,13 +1018,11 @@ async def get_nature_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[s
     print(f"[Nature] Fetching PDF for DOI: {doi}")
     url = f"https://www.nature.com/articles/{quote(doi)}.pdf"
     try:
-        # Check if PDF exists
         r = await client.head(url, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             print(f"[Nature] PDF URL found: {url}")
             return {"pdf_url": url, "host_type": "Nature", "source": "Nature"}
         else:
-            # Try to extract PDF from the article page
             article_url = f"https://www.nature.com/articles/{quote(doi)}"
             direct_pdf = await extract_pdf_from_page(article_url, client)
             if direct_pdf:
@@ -1104,13 +1039,11 @@ async def get_science_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[
     print(f"[Science] Fetching PDF for DOI: {doi}")
     url = f"https://www.science.org/doi/pdf/{quote(doi)}"
     try:
-        # Check if PDF exists
         r = await client.head(url, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             print(f"[Science] PDF URL found: {url}")
             return {"pdf_url": url, "host_type": "Science", "source": "Science"}
         else:
-            # Try to extract PDF from the article page
             article_url = f"https://www.science.org/doi/{quote(doi)}"
             direct_pdf = await extract_pdf_from_page(article_url, client)
             if direct_pdf:
@@ -1131,7 +1064,6 @@ async def get_jstor_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
         r.raise_for_status()
         content = r.text
         
-        # Look for direct PDF links in the page
         patterns = [
             r'href=["\']([^"\']*\.pdf)["\']',
             r'["\']([^"\']*\.pdf)["\']',
@@ -1141,15 +1073,12 @@ async def get_jstor_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
             matches = re.findall(pattern, content, re.IGNORECASE)
             for match in matches:
                 if match.startswith("/"):
-                    # Convert relative URL to absolute
                     base_url = "https://www.jstor.org"
                     match = base_url + match
                 elif not match.startswith("http"):
-                    # Convert relative URL to absolute
                     base_url = "https://www.jstor.org"
                     match = base_url + "/" + match
                 
-                # Verify it's a PDF
                 if await verify_pdf_url(match, client):
                     print(f"[JSTOR] PDF URL found: {match}")
                     return {"pdf_url": match, "host_type": "JSTOR", "source": "JSTOR"}
@@ -1168,7 +1097,6 @@ async def get_ssrn_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
         r.raise_for_status()
         content = r.text
         
-        # Look for direct PDF links in the page
         patterns = [
             r'href=["\']([^"\']*\.pdf)["\']',
             r'["\']([^"\']*\.pdf)["\']',
@@ -1178,15 +1106,12 @@ async def get_ssrn_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
             matches = re.findall(pattern, content, re.IGNORECASE)
             for match in matches:
                 if match.startswith("/"):
-                    # Convert relative URL to absolute
                     base_url = "https://papers.ssrn.com"
                     match = base_url + match
                 elif not match.startswith("http"):
-                    # Convert relative URL to absolute
                     base_url = "https://papers.ssrn.com"
                     match = base_url + "/" + match
                 
-                # Verify it's a PDF
                 if await verify_pdf_url(match, client):
                     print(f"[SSRN] PDF URL found: {match}")
                     return {"pdf_url": match, "host_type": "SSRN", "source": "SSRN"}
@@ -1205,7 +1130,6 @@ async def get_repec_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
         r.raise_for_status()
         content = r.text
         
-        # Look for direct PDF links in the page
         patterns = [
             r'href=["\']([^"\']*\.pdf)["\']',
             r'["\']([^"\']*\.pdf)["\']',
@@ -1215,15 +1139,12 @@ async def get_repec_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
             matches = re.findall(pattern, content, re.IGNORECASE)
             for match in matches:
                 if match.startswith("/"):
-                    # Convert relative URL to absolute
                     base_url = "https://ideas.repec.org"
                     match = base_url + match
                 elif not match.startswith("http"):
-                    # Convert relative URL to absolute
                     base_url = "https://ideas.repec.org"
                     match = base_url + "/" + match
                 
-                # Verify it's a PDF
                 if await verify_pdf_url(match, client):
                     print(f"[RePEc] PDF URL found: {match}")
                     return {"pdf_url": match, "host_type": "RePEc", "source": "RePEc"}
@@ -1236,7 +1157,6 @@ async def get_repec_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
 async def get_pmc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     await rate_limit("pmc")
     print(f"[PMC] Fetching PDF for DOI: {doi}")
-    # First, get the PMC ID from the DOI
     url = f"https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids={quote(doi)}&format=json"
     try:
         r = await client.get(url, timeout=REQUEST_TIMEOUT)
@@ -1252,19 +1172,16 @@ async def get_pmc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str,
             print("[PMC] No PMC ID found in record")
             return None
         
-        # Try direct PDF URL
         pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc_id}/pdf/{pmc_id}.pdf"
         if await verify_pdf_url(pdf_url, client):
             print(f"[PMC] PDF URL found: {pdf_url}")
             return {"pdf_url": pdf_url, "host_type": "PMC", "source": "PMC"}
         
-        # Try alternative PDF URL
         pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc_id}/pdf"
         if await verify_pdf_url(pdf_url, client):
             print(f"[PMC] Alternative PDF URL found: {pdf_url}")
             return {"pdf_url": pdf_url, "host_type": "PMC", "source": "PMC"}
         
-        # Try to extract PDF from the article page
         article_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc_id}"
         direct_pdf = await extract_pdf_from_page(article_url, client)
         if direct_pdf:
@@ -1285,7 +1202,6 @@ async def get_citeseerx_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dic
         r.raise_for_status()
         content = r.text
         
-        # Look for direct PDF links in the page
         patterns = [
             r'href=["\']([^"\']*\.pdf)["\']',
             r'["\']([^"\']*\.pdf)["\']',
@@ -1295,15 +1211,12 @@ async def get_citeseerx_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dic
             matches = re.findall(pattern, content, re.IGNORECASE)
             for match in matches:
                 if match.startswith("/"):
-                    # Convert relative URL to absolute
                     base_url = "http://citeseerx.ist.psu.edu"
                     match = base_url + match
                 elif not match.startswith("http"):
-                    # Convert relative URL to absolute
                     base_url = "http://citeseerx.ist.psu.edu"
                     match = base_url + "/" + match
                 
-                # Verify it's a PDF
                 if await verify_pdf_url(match, client):
                     print(f"[CiteSeerX] PDF URL found: {match}")
                     return {"pdf_url": match, "host_type": "CiteSeerX", "source": "CiteSeerX"}
@@ -1322,7 +1235,6 @@ async def get_researchgate_pdf(doi: str, client: httpx.AsyncClient) -> Optional[
         r.raise_for_status()
         content = r.text
         
-        # Look for direct PDF links in the page
         patterns = [
             r'href=["\']([^"\']*\.pdf)["\']',
             r'["\']([^"\']*\.pdf)["\']',
@@ -1332,15 +1244,12 @@ async def get_researchgate_pdf(doi: str, client: httpx.AsyncClient) -> Optional[
             matches = re.findall(pattern, content, re.IGNORECASE)
             for match in matches:
                 if match.startswith("/"):
-                    # Convert relative URL to absolute
                     base_url = "https://www.researchgate.net"
                     match = base_url + match
                 elif not match.startswith("http"):
-                    # Convert relative URL to absolute
                     base_url = "https://www.researchgate.net"
                     match = base_url + "/" + match
                 
-                # Verify it's a PDF
                 if await verify_pdf_url(match, client):
                     print(f"[ResearchGate] PDF URL found: {match}")
                     return {"pdf_url": match, "host_type": "ResearchGate", "source": "ResearchGate"}
@@ -1362,26 +1271,21 @@ async def get_plos_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> Opti
             return None
         doc = docs[0]
         
-        # Get article ID from the response
         article_id = doc.get("id")
         if not article_id:
             print("[PLOS] No article ID found")
             return None
             
-        # Determine the journal from the response
         journal = doc.get("journal")
         if not journal:
-            journal = "plosone"  # Default to PLOS ONE if not specified
+            journal = "plosone"
             
-        # Construct the correct PDF URL for PLOS journals
         pdf_url = f"https://journals.plos.org/{journal}/article/file?id={article_id}&type=printable"
         
-        # Verify the PDF URL is accessible
         try:
             pdf_response = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
             if pdf_response.status_code != 200:
                 print(f"[PLOS] PDF URL not accessible: {pdf_url}, status: {pdf_response.status_code}")
-                # Try alternative URL format
                 pdf_url = f"https://journals.plos.org/{journal}/article/file?id={article_id}&type=full"
                 pdf_response = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
                 if pdf_response.status_code != 200:
@@ -1420,7 +1324,6 @@ async def get_share_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
         for item in results:
             attrs = item.get('attributes', {})
 
-            # Check 'sources' for PDF URLs
             sources = attrs.get('sources', [])
             for source in sources:
                 url = source.get('url')
@@ -1428,25 +1331,21 @@ async def get_share_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
                     print(f"[Share API] PDF URL found in sources: {url}")
                     return {"pdf_url": url, "host_type": "Share API", "source": "Share"}
                 elif url and url.lower().endswith('.pdf'):
-                    # Try to extract PDF from the page
                     direct_pdf = await extract_pdf_from_page(url, client)
                     if direct_pdf:
                         print(f"[Share API] Direct PDF extracted from sources: {direct_pdf}")
                         return {"pdf_url": direct_pdf, "host_type": "Share API", "source": "Share"}
 
-            # Check 'fulltext' field
             fulltext_url = attrs.get('fulltext')
             if fulltext_url and fulltext_url.lower().endswith('.pdf') and await verify_pdf_url(fulltext_url, client):
                 print(f"[Share API] PDF URL found in fulltext: {fulltext_url}")
                 return {"pdf_url": fulltext_url, "host_type": "Share API", "source": "Share"}
             elif fulltext_url and fulltext_url.lower().endswith('.pdf'):
-                # Try to extract PDF from the page
                 direct_pdf = await extract_pdf_from_page(fulltext_url, client)
                 if direct_pdf:
                     print(f"[Share API] Direct PDF extracted from fulltext: {direct_pdf}")
                     return {"pdf_url": direct_pdf, "host_type": "Share API", "source": "Share"}
 
-            # Check 'links' dictionary
             links = attrs.get('links', {})
             for key in ['pdf', 'html']:
                 link_url = links.get(key)
@@ -1454,7 +1353,6 @@ async def get_share_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
                     print(f"[Share API] PDF URL found in links[{key}]: {link_url}")
                     return {"pdf_url": link_url, "host_type": "Share API", "source": "Share"}
                 elif link_url and link_url.lower().endswith('.pdf'):
-                    # Try to extract PDF from the page
                     direct_pdf = await extract_pdf_from_page(link_url, client)
                     if direct_pdf:
                         print(f"[Share API] Direct PDF extracted from links[{key}]: {direct_pdf}")
@@ -1477,7 +1375,6 @@ async def get_internetarchive_pdf(doi: str, client: httpx.AsyncClient) -> Option
             identifier = doc.get("identifier")
             if identifier:
                 pdf_url = f"https://archive.org/download/{identifier}/{identifier}.pdf"
-                # Check PDF existence
                 head = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
                 if head.status_code == 200:
                     print(f"[Internet Archive] PDF URL found: {pdf_url}")
@@ -1507,7 +1404,6 @@ async def get_hal_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str,
                 print(f"[HAL] PDF URL found: {pdf_url}")
                 return {"pdf_url": pdf_url, "host_type": "HAL", "source": "HAL"}
             else:
-                # Try to extract PDF from the page
                 direct_pdf = await extract_pdf_from_page(pdf_url, client)
                 if direct_pdf:
                     print(f"[HAL] Direct PDF extracted from page: {direct_pdf}")
@@ -1546,7 +1442,6 @@ async def get_openaire_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> 
                     }
                     return {"pdf_url": pdf_url, "host_type": "OpenAIRE", "source": "OpenAIRE", "metadata": metadata}
                 else:
-                    # Try to extract PDF from the page
                     direct_pdf = await extract_pdf_from_page(pdf_url, client)
                     if direct_pdf:
                         print(f"[OpenAIRE] Direct PDF extracted from page: {direct_pdf}")
@@ -1594,7 +1489,6 @@ async def get_doaj_metadata_and_pdf(doi: str, client: httpx.AsyncClient) -> Opti
                 }
                 return {"pdf_url": pdf_url, "host_type": "DOAJ", "source": "DOAJ", "metadata": metadata}
             else:
-                # Try to extract PDF from the page
                 direct_pdf = await extract_pdf_from_page(pdf_url, client)
                 if direct_pdf:
                     print(f"[DOAJ] Direct PDF extracted from page: {direct_pdf}")
@@ -1611,47 +1505,24 @@ async def get_doaj_metadata_and_pdf(doi: str, client: httpx.AsyncClient) -> Opti
         print(f"[DOAJ] Fetch error: {e}")
     return None
 
-# Priority-based source selection
-# Higher priority sources are checked first
 PDF_SOURCES_PRIORITY = [
-    # Preprint servers (highest priority for quick access)
     "arxiv", "biorxiv", "medrxiv", "chemrxiv", "f1000", "elife",
-    
-    # Open access repositories
     "unpaywall", "europepmc", "pmc", "zenodo", "figshare", "doaj", "openaire",
-    
-    # Publisher-specific (open access)
     "plos", "frontiers", "mdpi", "hindawi", "copernicus", "elife", "f1000",
-    
-    # Institutional repositories
     "base", "hal", "internetarchive",
-    
-    # General DOI resolution
     "doi",
-    
-    # Publisher-specific (may have paywalls)
     "springer", "elsevier", "wiley", "nature", "science", "cell",
     "iop", "aps", "aip", "rsc", "acs", "ieee", "acm",
-    
-    # Academic social networks
     "researchgate", "ssrn", "repec", "citeseerx",
-    
-    # Archives
     "jstor", "share",
 ]
 
 METADATA_SOURCES_PRIORITY = [
-    # Primary metadata sources
     "crossref", "openalex", "semantic_scholar", "pubmed",
-    
-    # Repository metadata
     "openaire", "doaj", "dryad", "internetarchive",
-    
-    # Specialized metadata
     "wikidata", "google_books",
 ]
 
-# Map source names to functions
 PDF_SOURCE_FUNCTIONS = {
     "doi": get_pdf_url_from_doi,
     "unpaywall": get_unpaywall_pdf,
@@ -1707,7 +1578,7 @@ METADATA_SOURCE_FUNCTIONS = {
     "internetarchive": get_internetarchive_metadata,
     "wikidata": get_wikidata_metadata,
     "google_books": get_google_books_metadata,
-    "plos": get_plos_pdf_and_metadata,  # This function returns both PDF and metadata
+    "plos": get_plos_pdf_and_metadata,
 }
 
 def check_and_increment_google_books() -> bool:
@@ -1720,10 +1591,8 @@ async def search(data: dict):
         raise HTTPException(status_code=400, detail="DOI is required")
 
     try:
-        # Use the shared client from app state
         client = app.state.client
         
-        # Create a semaphore to limit concurrent requests
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         
         async def limited_fetch(source_name, fetch_func, *args, **kwargs):
@@ -1737,7 +1606,6 @@ async def search(data: dict):
                     print(f"[{source_name}] Error: {e}")
                     return None
         
-        # Create tasks for PDF sources in priority order
         pdf_tasks = []
         for source in PDF_SOURCES_PRIORITY:
             if source in PDF_SOURCE_FUNCTIONS:
@@ -1746,7 +1614,6 @@ async def search(data: dict):
                 )
                 pdf_tasks.append((source, task))
         
-        # Create tasks for metadata sources in priority order
         metadata_tasks = []
         for source in METADATA_SOURCES_PRIORITY:
             if source in METADATA_SOURCE_FUNCTIONS:
@@ -1758,7 +1625,6 @@ async def search(data: dict):
         pdf_result = None
         metadata = None
         
-        # Process PDF sources in priority order with early termination
         for source_name, task in pdf_tasks:
             try:
                 result = await task
@@ -1770,7 +1636,6 @@ async def search(data: dict):
                     }
                     print(f"[Found PDF] from {source_name}: {pdf_result['pdf_url']}")
                     
-                    # Extract metadata from PDF source if available
                     if result.get("metadata"):
                         metadata = result["metadata"]
                     
@@ -1778,7 +1643,6 @@ async def search(data: dict):
             except Exception as e:
                 print(f"[{source_name}] Error: {e}")
         
-        # Cancel remaining PDF tasks if we found a PDF
         if pdf_result:
             for _, task in pdf_tasks:
                 if not task.done():
@@ -1788,25 +1652,20 @@ async def search(data: dict):
                     except asyncio.CancelledError:
                         pass
         
-        # Process metadata sources with a timeout
         try:
-            # Get a list of active metadata tasks
             active_metadata_tasks = [task for _, task in metadata_tasks if not task.done()]
             
             if active_metadata_tasks:
-                # Wait for first metadata source to complete
                 done, pending = await asyncio.wait(
                     active_metadata_tasks,
                     return_when=asyncio.FIRST_COMPLETED,
-                    timeout=3.0  # Short timeout for first result
+                    timeout=3.0
                 )
                 
-                # Get the first result
                 for task in done:
                     try:
                         result = task.result()
                         if result:
-                            # If we already have metadata from a PDF source, merge it
                             if metadata:
                                 metadata = merge_metadata(metadata, result)
                             else:
@@ -1815,7 +1674,6 @@ async def search(data: dict):
                     except Exception:
                         pass
                 
-                # Cancel remaining tasks
                 for task in pending:
                     task.cancel()
                     try:
@@ -1823,22 +1681,19 @@ async def search(data: dict):
                     except asyncio.CancelledError:
                         pass
                 
-                # If no metadata yet, wait a bit longer for any source
                 if not metadata:
-                    # Get a list of still active tasks
                     still_active_tasks = [task for _, task in metadata_tasks if not task.done()]
                     
                     if still_active_tasks:
                         done, pending = await asyncio.wait(
                             still_active_tasks,
-                            timeout=2.0  # Additional timeout
+                            timeout=2.0
                         )
                         
                         for task in done:
                             try:
                                 result = task.result()
                                 if result:
-                                    # If we already have metadata from a PDF source, merge it
                                     if metadata:
                                         metadata = merge_metadata(metadata, result)
                                     else:
@@ -1847,7 +1702,6 @@ async def search(data: dict):
                             except Exception:
                                 pass
                         
-                        # Cancel any remaining tasks
                         for task in pending:
                             task.cancel()
                             try:
@@ -1857,7 +1711,6 @@ async def search(data: dict):
         except Exception as e:
             print(f"[Search API Error] {e}")
         
-        # Fallback metadata
         if metadata is None:
             metadata = {}
             no_meta_message = "No metadata found"
@@ -1870,7 +1723,6 @@ async def search(data: dict):
         if authors and isinstance(authors, list) and isinstance(authors[0], dict):
             author_name = authors[0].get("name", "Unknown")
         
-        # Clean up memory
         gc.collect()
         
         if pdf_result:
