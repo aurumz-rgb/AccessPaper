@@ -1,4 +1,4 @@
-![Preview](screenshots/preview1.png)
+![Preview](screenshots/preview11.png)
 
 **AccessPaper** is a research tool that helps you quickly find and access legal copies of full-text research papers using their DOI, providing a simple and efficient way to retrieve full-text documents.
 
