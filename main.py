@@ -75,6 +75,7 @@ API_RATE_LIMITS = {
     "acs": 1.0,
     "ieee": 1.0,
     "acm": 1.0,
+    "pmc": 1.0,
 }
 
 # Last request time for each API
@@ -585,7 +586,7 @@ async def get_base_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
     try:
         r = await client.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
-        data = await r.json()  # await here!
+        data = r.json()  # Fixed: removed await here
 
         records = data.get("records", [])
         for record in records:
@@ -1706,9 +1707,7 @@ METADATA_SOURCE_FUNCTIONS = {
     "internetarchive": get_internetarchive_metadata,
     "wikidata": get_wikidata_metadata,
     "google_books": get_google_books_metadata,
-    "plos": get_plos_pdf_and_metadata,
-    "openaire": get_openaire_pdf_and_metadata,
-    "doaj": get_doaj_metadata_and_pdf,
+    "plos": get_plos_pdf_and_metadata,  # This function returns both PDF and metadata
 }
 
 def check_and_increment_google_books() -> bool:
