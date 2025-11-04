@@ -1770,6 +1770,11 @@ async def search(data: dict):
                         "source": result.get("source", source_name),
                     }
                     print(f"[Found PDF] from {source_name}: {pdf_result['pdf_url']}")
+                    
+                    # Extract metadata from PDF source if available
+                    if result.get("metadata"):
+                        metadata = result["metadata"]
+                    
                     break
             except Exception as e:
                 print(f"[{source_name}] Error: {e}")
@@ -1802,7 +1807,11 @@ async def search(data: dict):
                     try:
                         result = task.result()
                         if result:
-                            metadata = result
+                            # If we already have metadata from a PDF source, merge it
+                            if metadata:
+                                metadata = merge_metadata(metadata, result)
+                            else:
+                                metadata = result
                             break
                     except Exception:
                         pass
@@ -1830,7 +1839,11 @@ async def search(data: dict):
                             try:
                                 result = task.result()
                                 if result:
-                                    metadata = result
+                                    # If we already have metadata from a PDF source, merge it
+                                    if metadata:
+                                        metadata = merge_metadata(metadata, result)
+                                    else:
+                                        metadata = result
                                     break
                             except Exception:
                                 pass
