@@ -236,14 +236,58 @@ async def get_core_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
             return None
         
         for item in results:
-            full_text_urls = item.get("fullTextUrl", [])
-            if not full_text_urls:
+            # Get the CORE ID for direct PDF access
+            core_id = item.get("id")
+            if not core_id:
                 continue
-            for url_data in full_text_urls:
-                url_ = url_data.get("url")
-                if url_ and url_.lower().endswith(".pdf"):
-                    print(f"[CORE] PDF URL found: {url_}")
-                    return {"pdf_url": url_, "host_type": "CORE", "source": "CORE"}
+                
+            # Try direct PDF download URL format
+            direct_pdf_url = f"https://core.ac.uk/download/pdf/{core_id}.pdf"
+            try:
+                head_response = await client.head(direct_pdf_url, timeout=REQUEST_TIMEOUT)
+                if head_response.status_code == 200:
+                    print(f"[CORE] Direct PDF URL found and verified: {direct_pdf_url}")
+                    return {"pdf_url": direct_pdf_url, "host_type": "CORE", "source": "CORE"}
+            except Exception as e:
+                print(f"[CORE] Direct PDF URL verification failed: {e}")
+            
+            # Check for downloadUrl field
+            download_url = item.get("downloadUrl")
+            if download_url:
+                # Verify it's a direct PDF link, not a web page
+                try:
+                    head_response = await client.head(download_url, timeout=REQUEST_TIMEOUT)
+                    content_type = head_response.headers.get("content-type", "").lower()
+                    if "pdf" in content_type or download_url.lower().endswith(".pdf"):
+                        print(f"[CORE] PDF URL found and verified: {download_url}")
+                        return {"pdf_url": download_url, "host_type": "CORE", "source": "CORE"}
+                except Exception as e:
+                    print(f"[CORE] PDF URL verification failed for {download_url}: {e}")
+            
+            # Check fullTextUrl field
+            full_text_url = item.get("fullTextUrl")
+            if full_text_url:
+                # Handle both string and list formats
+                urls_to_check = []
+                if isinstance(full_text_url, list):
+                    urls_to_check = full_text_url
+                else:
+                    urls_to_check = [full_text_url]
+                
+                for url_ in urls_to_check:
+                    if not url_:
+                        continue
+                        
+                    # Verify it's a direct PDF link
+                    try:
+                        head_response = await client.head(url_, timeout=REQUEST_TIMEOUT)
+                        content_type = head_response.headers.get("content-type", "").lower()
+                        if "pdf" in content_type or url_.lower().endswith(".pdf"):
+                            print(f"[CORE] PDF URL found and verified: {url_}")
+                            return {"pdf_url": url_, "host_type": "CORE", "source": "CORE"}
+                    except Exception as e:
+                        print(f"[CORE] PDF URL verification failed for {url_}: {e}")
+                        continue
         
         print("[CORE] No valid PDF link found in results")
     except Exception as e:
@@ -501,14 +545,42 @@ async def get_plos_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> Opti
             print("[PLOS] No results found")
             return None
         doc = docs[0]
-        # PLOS PDFs are usually at this pattern
-        pdf_url = f"http://journals.plos.org/plosone/article/file?id={quote(doi)}&type=printable"
+        
+        # Get article ID from the response
+        article_id = doc.get("id")
+        if not article_id:
+            print("[PLOS] No article ID found")
+            return None
+            
+        # Determine the journal from the response
+        journal = doc.get("journal")
+        if not journal:
+            journal = "plosone"  # Default to PLOS ONE if not specified
+            
+        # Construct the correct PDF URL for PLOS journals
+        pdf_url = f"https://journals.plos.org/{journal}/article/file?id={article_id}&type=printable"
+        
+        # Verify the PDF URL is accessible
+        try:
+            pdf_response = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+            if pdf_response.status_code != 200:
+                print(f"[PLOS] PDF URL not accessible: {pdf_url}, status: {pdf_response.status_code}")
+                # Try alternative URL format
+                pdf_url = f"https://journals.plos.org/{journal}/article/file?id={article_id}&type=full"
+                pdf_response = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+                if pdf_response.status_code != 200:
+                    print(f"[PLOS] Alternative PDF URL not accessible: {pdf_url}, status: {pdf_response.status_code}")
+                    return None
+        except Exception as e:
+            print(f"[PLOS] Error checking PDF URL: {e}")
+            return None
+            
         print(f"[PLOS] PDF URL found: {pdf_url}")
         metadata = {
             "title": doc.get("title"),
             "authors": [{"name": a} for a in doc.get("author", [])],
             "corresponding_email": None,
-            "journal": doc.get("journal"),
+            "journal": journal,
             "year": doc.get("publication_date", "")[:4],
         }
         return {"pdf_url": pdf_url, "host_type": "PLOS", "source": "PLOS", "metadata": metadata}
@@ -606,15 +678,75 @@ async def get_core_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> Opti
         if not docs:
             return None
         doc = docs[0]
+        
+        # Get the CORE ID for direct PDF access
+        core_id = doc.get("id")
+        
+        # Extract metadata
         metadata = {
             "title": doc.get("title"),
             "authors": [{"name": a.get("name")} for a in doc.get("authors", [])],
+            "journal": doc.get("journal", {}).get("title") if doc.get("journal") else None,
+            "year": doc.get("yearPublished"),
+            "abstract": doc.get("abstract"),
         }
-        pdf_url = doc.get("downloadUrl")
+        
         result = {"metadata": metadata}
+        pdf_url = None
+        
+        # Try direct PDF download URL format first
+        if core_id:
+            direct_pdf_url = f"https://core.ac.uk/download/pdf/{core_id}.pdf"
+            try:
+                head_response = await client.head(direct_pdf_url, timeout=REQUEST_TIMEOUT)
+                if head_response.status_code == 200:
+                    pdf_url = direct_pdf_url
+                    print(f"[CORE] Direct PDF URL found and verified: {direct_pdf_url}")
+            except Exception as e:
+                print(f"[CORE] Direct PDF URL verification failed: {e}")
+        
+        # If direct URL didn't work, try other fields
+        if not pdf_url:
+            # Check downloadUrl field
+            download_url = doc.get("downloadUrl")
+            if download_url:
+                try:
+                    head_response = await client.head(download_url, timeout=REQUEST_TIMEOUT)
+                    content_type = head_response.headers.get("content-type", "").lower()
+                    if "pdf" in content_type or download_url.lower().endswith(".pdf"):
+                        pdf_url = download_url
+                        print(f"[CORE] PDF URL found and verified: {download_url}")
+                except Exception as e:
+                    print(f"[CORE] PDF URL verification failed for {download_url}: {e}")
+            
+            # Check fullTextUrl field
+            if not pdf_url:
+                full_text_url = doc.get("fullTextUrl")
+                if full_text_url:
+                    urls_to_check = []
+                    if isinstance(full_text_url, list):
+                        urls_to_check = full_text_url
+                    else:
+                        urls_to_check = [full_text_url]
+                    
+                    for url_ in urls_to_check:
+                        if not url_:
+                            continue
+                            
+                        try:
+                            head_response = await client.head(url_, timeout=REQUEST_TIMEOUT)
+                            content_type = head_response.headers.get("content-type", "").lower()
+                            if "pdf" in content_type or url_.lower().endswith(".pdf"):
+                                pdf_url = url_
+                                print(f"[CORE] PDF URL found and verified: {url_}")
+                                break
+                        except Exception as e:
+                            print(f"[CORE] PDF URL verification failed for {url_}: {e}")
+                            continue
+        
         if pdf_url:
             result.update({"pdf_url": pdf_url, "host_type": "CORE", "source": "CORE"})
-            print(f"[CORE] PDF URL found: {pdf_url}")
+        
         return result
     except Exception as e:
         print(f"[CORE] Fetch error: {e}")
