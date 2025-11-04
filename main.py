@@ -3,7 +3,7 @@ import json
 import asyncio
 from datetime import datetime
 from threading import RLock
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import quote as url_quote
 import xml.etree.ElementTree as ET
 from datetime import date
@@ -11,21 +11,74 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+import re
+import time
+from functools import lru_cache
+import weakref
+import gc
 
 load_dotenv()
 
-REQUEST_TIMEOUT = 5 # seconds
+REQUEST_TIMEOUT = 5  # seconds
+MAX_CONCURRENT_REQUESTS = 10  # Limit concurrent requests to reduce RAM usage
+RATE_LIMIT_DELAY = 0.5  # Delay between requests to respect API rates
 
 BASE_API_ENABLED = os.getenv("BASE_API_ENABLED") 
 GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY", "")
 UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", "email@example.com")
 
- 
+# Rate limiting for different APIs
+API_RATE_LIMITS = {
+    "crossref": 1.0,  # seconds between requests
+    "openalex": 1.0,
+    "semantic_scholar": 1.0,
+    "unpaywall": 1.0,
+    "base": 2.0,
+    "zenodo": 1.0,
+    "figshare": 1.0,
+    "europepmc": 1.0,
+    "arxiv": 1.0,
+    "biorxiv": 1.0,
+    "medrxiv": 1.0,
+    "internetarchive": 1.0,
+    "hal": 1.0,
+    "plos": 1.0,
+    "doaj": 1.0,
+    "share": 1.0,
+    "pubmed": 1.0,
+    "dryad": 1.0,
+    "openaire": 1.0,
+    "wikidata": 1.0,
+    "google_books": 1.0,
+    "springer": 1.0,
+    "elsevier": 1.0,
+    "wiley": 1.0,
+    "nature": 1.0,
+    "science": 1.0,
+    "jstor": 1.0,
+    "ssrn": 1.0,
+    "repec": 1.0,
+    "citeseerx": 1.0,
+    "researchgate": 1.0,
+    "chemrxiv": 1.0,
+    "f1000": 1.0,
+    "elife": 1.0,
+    "cell": 1.0,
+    "frontiers": 1.0,
+    "mdpi": 1.0,
+    "hindawi": 1.0,
+    "copernicus": 1.0,
+    "iop": 1.0,
+    "aps": 1.0,
+    "aip": 1.0,
+    "rsc": 1.0,
+    "acs": 1.0,
+    "ieee": 1.0,
+    "acm": 1.0,
+}
 
-def check_and_increment_google_books() -> bool:
-    return True
-
-
+# Last request time for each API
+last_request_time = {api: 0 for api in API_RATE_LIMITS}
 
 app = FastAPI()
 
@@ -33,6 +86,12 @@ app = FastAPI()
 async def on_startup():
     try:
         print("App startup")
+        # Set up connection pool to reduce overhead
+        app.state.client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=MAX_CONCURRENT_REQUESTS),
+            timeout=REQUEST_TIMEOUT,
+            follow_redirects=True
+        )
     except Exception as e:
         print(f"Error on startup: {e}")
 
@@ -40,17 +99,18 @@ async def on_startup():
 async def on_shutdown():
     try:
         print("App shutdown")
+        # Clean up resources
+        await app.state.client.aclose()
     except Exception as e:
         print(f"Error on shutdown: {e}")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://accesspaper.vercel.app"],  #imp
+    allow_origins=["https://accesspaper.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 def merge_metadata(base: dict, new: dict) -> dict:
     """
@@ -76,11 +136,19 @@ def merge_metadata(base: dict, new: dict) -> dict:
 
     return base
 
-
-
 def quote(text: Optional[str]) -> str:
     return url_quote(text or "")
 
+async def rate_limit(api_name: str):
+    """Implement rate limiting for API calls"""
+    current_time = time.time()
+    last_time = last_request_time.get(api_name, 0)
+    time_since_last = current_time - last_time
+    
+    if time_since_last < API_RATE_LIMITS.get(api_name, RATE_LIMIT_DELAY):
+        await asyncio.sleep(API_RATE_LIMITS.get(api_name, RATE_LIMIT_DELAY) - time_since_last)
+    
+    last_request_time[api_name] = time.time()
 
 async def verify_pdf_url(url: str, client: httpx.AsyncClient) -> bool:
     """
@@ -98,7 +166,6 @@ async def verify_pdf_url(url: str, client: httpx.AsyncClient) -> bool:
     except Exception:
         return False
 
-
 async def extract_pdf_from_page(page_url: str, client: httpx.AsyncClient) -> Optional[str]:
     """
     Try to extract a direct PDF link from a web page
@@ -115,7 +182,6 @@ async def extract_pdf_from_page(page_url: str, client: httpx.AsyncClient) -> Opt
             r'href=["\']([^"\']*\/download)["\']',
         ]
         
-        import re
         for pattern in patterns:
             matches = re.findall(pattern, content, re.IGNORECASE)
             for match in matches:
@@ -136,8 +202,9 @@ async def extract_pdf_from_page(page_url: str, client: httpx.AsyncClient) -> Opt
     except Exception:
         return None
 
-
+# Metadata fetchers
 async def get_crossref_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("crossref")
     print(f"[Crossref] Fetching metadata for DOI: {doi}")
     url = f"https://api.crossref.org/works/{quote(doi)}"
     try:
@@ -164,8 +231,221 @@ async def get_crossref_metadata(doi: str, client: httpx.AsyncClient) -> Optional
         print(f"[Crossref] metadata fetch error: {e}")
         return None
 
+async def get_openalex_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("openalex")
+    print(f"[OpenAlex] Fetching metadata for DOI: {doi}")
+    url = f"https://api.openalex.org/works/https://doi.org/{quote(doi)}"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        authorships = data.get("authorships", [])
+        authors = [{"name": a.get("author", {}).get("display_name", ""), "affiliation": ""} for a in authorships]
+        return {
+            "title": data.get("title"),
+            "authors": authors,
+            "corresponding_email": None,
+            "journal": data.get("host_venue", {}).get("display_name"),
+            "year": data.get("publication_year")
+        }
+    except Exception as e:
+        print(f"[OpenAlex] metadata fetch error: {e}")
+        return None
 
+async def get_semantic_scholar_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("semantic_scholar")
+    print(f"[Semantic Scholar] Fetching metadata for DOI: {doi}")
+    url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{quote(doi)}?fields=title,authors,journal,year"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        authors = [{"name": a.get("name", ""), "affiliation": ""} for a in data.get("authors", [])]
+        return {
+            "title": data.get("title"),
+            "authors": authors,
+            "corresponding_email": None,
+            "journal": data.get("journal", {}).get("name"),
+            "year": data.get("year")
+        }
+    except Exception as e:
+        print(f"[Semantic Scholar] metadata fetch error: {e}")
+        return None
 
+async def get_pubmed_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("pubmed")
+    print(f"[PubMed] Fetching metadata for DOI: {doi}")
+    url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={quote(doi)}[DOI]&retmode=json"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        idlist = data.get("esearchresult", {}).get("idlist", [])
+        if not idlist:
+            print("[PubMed] No PMID found for DOI")
+            return None
+        pmid = idlist[0]
+        summary_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id={pmid}&retmode=json"
+        r2 = await client.get(summary_url, timeout=REQUEST_TIMEOUT)
+        r2.raise_for_status()
+        summary = r2.json()
+        doc = summary.get("result", {}).get(pmid, {})
+        metadata = {
+            "title": doc.get("title"),
+            "authors": [{"name": a.get("name")} for a in doc.get("authors", [])] if doc.get("authors") else [],
+            "pubdate": doc.get("pubdate"),
+        }
+        print(f"[PubMed] Metadata fetched: {metadata}")
+        return metadata
+    except Exception as e:
+        print(f"[PubMed] Fetch error: {e}")
+        return None
+
+async def get_doaj_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("doaj")
+    print(f"[DOAJ] Fetching metadata for DOI: {doi}")
+    url = f"https://doaj.org/api/v2/search/articles/doi:{quote(doi)}"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results", [])
+        if not results:
+            print("[DOAJ] No results found")
+            return None
+        article = results[0].get("bibjson", {})
+        metadata = {
+            "title": article.get("title"),
+            "authors": [{"name": a.get("name")} for a in article.get("author", [])],
+            "corresponding_email": None,
+            "journal": article.get("journal", {}).get("title"),
+            "year": article.get("year"),
+        }
+        return metadata
+    except Exception as e:
+        print(f"[DOAJ] Fetch error: {e}")
+        return None
+
+async def get_dryad_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("dryad")
+    print(f"[Dryad] Fetching metadata for DOI: {doi}")
+    url = f"https://datadryad.org/api/v2/package/{quote(doi)}"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 404:
+            print("[Dryad] No data found (404)")
+            return None
+        r.raise_for_status()
+        data = r.json()
+        metadata = {
+            "title": data.get("title"),
+            "authors": [{"name": a.get("full_name")} for a in data.get("authors", [])],
+            "year": data.get("publication_year"),
+        }
+        print(f"[Dryad] Metadata fetched: {metadata}")
+        return metadata
+    except Exception as e:
+        print(f"[Dryad] Fetch error: {e}")
+        return None
+
+async def get_openaire_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("openaire")
+    print(f"[OpenAIRE] Fetching metadata for DOI: {doi}")
+    url = f"https://api.openaire.eu/search/publications?doi={quote(doi)}&format=json"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("result", {}).get("results", [])
+        if not results:
+            print("[OpenAIRE] No results found")
+            return None
+        item = results[0]
+        metadata = {
+            "title": item.get("title"),
+            "authors": [{"name": a} for a in item.get("authors", [])],
+            "year": item.get("publicationYear"),
+        }
+        print(f"[OpenAIRE] Metadata fetched: {metadata}")
+        return metadata
+    except Exception as e:
+        print(f"[OpenAIRE] Fetch error: {e}")
+        return None
+
+async def get_internetarchive_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("internetarchive")
+    print(f"[Internet Archive] Fetching metadata for DOI: {doi}")
+    url = f"https://archive.org/metadata/{quote(doi)}"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        metadata = {
+            "title": data.get("metadata", {}).get("title"),
+            "authors": [{"name": a} for a in data.get("metadata", {}).get("creator", [])] if isinstance(data.get("metadata", {}).get("creator"), list) else [],
+        }
+        print(f"[Internet Archive] Metadata fetched: {metadata}")
+        return metadata
+    except Exception as e:
+        print(f"[Internet Archive] Fetch error: {e}")
+        return None
+
+async def get_wikidata_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("wikidata")
+    print(f"[Wikidata SPARQL] Fetching metadata for DOI: {doi}")
+    query = f"""
+    SELECT ?item ?itemLabel WHERE {{
+      ?item wdt:P356 "{doi}".
+      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+    }}
+    """
+    url = "https://query.wikidata.org/sparql"
+    headers = {"Accept": "application/sparql-results+json"}
+    try:
+        r = await client.get(url, params={"query": query}, headers=headers, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        bindings = data.get("results", {}).get("bindings", [])
+        if not bindings:
+            print("[Wikidata SPARQL] No results found")
+            return None
+        item = bindings[0].get("itemLabel", {}).get("value")
+        metadata = {"title": item, "authors": []}
+        print(f"[Wikidata SPARQL] Metadata fetched: {metadata}")
+        return metadata
+    except Exception as e:
+        print(f"[Wikidata SPARQL] Fetch error: {e}")
+        return None
+
+async def get_google_books_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("google_books")
+    print(f"[Google Books] Fetching metadata for DOI: {doi}")
+    if not GOOGLE_BOOKS_API_KEY:
+        print("[Google Books] API key missing, skipping")
+        return None
+    
+    url = f"https://www.googleapis.com/books/v1/volumes?q=doi:{quote(doi)}&key={GOOGLE_BOOKS_API_KEY}"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("items", [])
+        if not items:
+            print("[Google Books] No items found")
+            return None
+        volume_info = items[0].get("volumeInfo", {})
+        metadata = {
+            "title": volume_info.get("title"),
+            "authors": [{"name": a} for a in volume_info.get("authors", [])],
+            "publishedDate": volume_info.get("publishedDate"),
+        }
+        print(f"[Google Books] Metadata fetched: {metadata}")
+        return metadata
+    except Exception as e:
+        print(f"[Google Books] Fetch error: {e}")
+        return None
+
+# PDF fetchers
 async def get_pdf_url_from_doi(doi: str, client: httpx.AsyncClient) -> Dict[str, str]:
     """
     Returns a dictionary with:
@@ -208,51 +488,8 @@ async def get_pdf_url_from_doi(doi: str, client: httpx.AsyncClient) -> Dict[str,
 
     return result
 
-
-
-
-async def get_openalex_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[OpenAlex] Fetching metadata for DOI: {doi}")
-    url = f"https://api.openalex.org/works/https://doi.org/{quote(doi)}"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        authorships = data.get("authorships", [])
-        authors = [{"name": a.get("author", {}).get("display_name", ""), "affiliation": ""} for a in authorships]
-        return {
-            "title": data.get("title"),
-            "authors": authors,
-            "corresponding_email": None,
-            "journal": data.get("host_venue", {}).get("display_name"),
-            "year": data.get("publication_year")
-        }
-    except Exception as e:
-        print(f"[OpenAlex] metadata fetch error: {e}")
-        return None
-
-async def get_semantic_scholar_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[Semantic Scholar] Fetching metadata for DOI: {doi}")
-    url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{quote(doi)}?fields=title,authors,journal,year"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        authors = [{"name": a.get("name", ""), "affiliation": ""} for a in data.get("authors", [])]
-        return {
-            "title": data.get("title"),
-            "authors": authors,
-            "corresponding_email": None,
-            "journal": data.get("journal", {}).get("name"),
-            "year": data.get("year")
-        }
-    except Exception as e:
-        print(f"[Semantic Scholar] metadata fetch error: {e}")
-        return None
-
-
-
 async def get_unpaywall_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("unpaywall")
     print(f"[Unpaywall] Fetching PDF for DOI: {doi}")
     url = f"https://api.unpaywall.org/v2/{quote(doi)}?email={UNPAYWALL_EMAIL}"
     try:
@@ -293,75 +530,47 @@ async def get_unpaywall_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dic
         print(f"[Unpaywall] PDF fetch error: {e}")
     return None
 
-async def get_zenodo_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[Zenodo] Fetching PDF for DOI: {doi}")
-    url = f"https://zenodo.org/api/records/?q=doi:{quote(doi)}"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        hits = r.json().get("hits", {}).get("hits", [])
-        for hit in hits:
-            for f in hit.get("files", []):
-                pdf_link = f.get("links", {}).get("self", "")
-                if pdf_link.lower().endswith(".pdf") and await verify_pdf_url(pdf_link, client):
-                    print(f"[Zenodo] PDF URL found: {pdf_link}")
-                    return {"pdf_url": pdf_link, "host_type": "Zenodo", "source": "Zenodo"}
-        print("[Zenodo] No valid PDF link found")
-    except Exception as e:
-        print(f"[Zenodo] PDF fetch error: {e}")
-    return None
-
-async def get_figshare_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[Figshare] Fetching PDF for DOI: {doi}")
-    url = f"https://api.figshare.com/v2/articles/search?search_for={quote(doi)}"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("items", [])
-        for item in items:
-            for f in item.get("files", []):
-                if f.get("name", "").lower().endswith(".pdf"):
-                    download_url = f.get("download_url")
-                    if download_url and await verify_pdf_url(download_url, client):
-                        print(f"[Figshare] PDF URL found: {download_url}")
-                        return {"pdf_url": download_url, "host_type": "Figshare", "source": "Figshare"}
-        print("[Figshare] No valid PDF link found")
-    except Exception as e:
-        print(f"[Figshare] PDF fetch error: {e}")
-    return None
-
-async def get_europepmc_preprints_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[EuropePMC Preprints] Fetching PDF for DOI: {doi}")
+async def get_europepmc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("europepmc")
+    print(f"[EuropePMC] Fetching PDF for DOI: {doi}")
     url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=doi:{quote(doi)}&format=json"
     try:
         r = await client.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         results = r.json().get("resultList", {}).get("result", [])
+
         for result in results:
-            if result.get("pubType", "").lower() != "preprint":
-                continue
             full_text_urls = result.get("fullTextUrlList", {}).get("fullTextUrl", [])
             for full_text_url in full_text_urls:
                 if full_text_url.get("documentStyle") == "pdf" and full_text_url.get("availability") == "OPEN_ACCESS":
                     pdf_link = full_text_url.get("url")
                     if await verify_pdf_url(pdf_link, client):
-                        print(f"[EuropePMC Preprints] PDF URL found: {pdf_link}")
-                        return {"pdf_url": pdf_link, "host_type": "EuropePMC Preprints", "source": "EuropePMC Preprints"}
+                        host_type = (
+                            "EuropePMC Preprints"
+                            if result.get("pubType", "").lower() == "preprint"
+                            else "EuropePMC"
+                        )
+                        print(f"[EuropePMC] PDF URL found: {pdf_link} (Type: {host_type})")
+                        return {"pdf_url": pdf_link, "host_type": host_type, "source": host_type}
                     else:
                         # Try to extract PDF from the page
                         direct_pdf = await extract_pdf_from_page(pdf_link, client)
                         if direct_pdf:
-                            print(f"[EuropePMC Preprints] Direct PDF extracted from page: {direct_pdf}")
-                            return {"pdf_url": direct_pdf, "host_type": "EuropePMC Preprints", "source": "EuropePMC Preprints"}
-        print("[EuropePMC Preprints] No valid PDF link found")
+                            host_type = (
+                                "EuropePMC Preprints"
+                                if result.get("pubType", "").lower() == "preprint"
+                                else "EuropePMC"
+                            )
+                            print(f"[EuropePMC] Direct PDF extracted from page: {direct_pdf} (Type: {host_type})")
+                            return {"pdf_url": direct_pdf, "host_type": host_type, "source": host_type}
+
+        print("[EuropePMC] No valid PDF link found")
     except Exception as e:
-        print(f"[EuropePMC Preprints] PDF fetch error: {e}")
+        print(f"[EuropePMC] PDF fetch error: {e}")
     return None
 
-
-
 async def get_base_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("base")
     print(f"[BASE] Fetching PDF for DOI: {doi}")
 
     url = f"https://api.base-search.net/beta/search?q=doi:{quote(doi)}&format=json&limit=1"
@@ -393,102 +602,48 @@ async def get_base_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
 
     return None
 
+async def get_zenodo_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("zenodo")
+    print(f"[Zenodo] Fetching PDF for DOI: {doi}")
+    url = f"https://zenodo.org/api/records/?q=doi:{quote(doi)}"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        hits = r.json().get("hits", {}).get("hits", [])
+        for hit in hits:
+            for f in hit.get("files", []):
+                pdf_link = f.get("links", {}).get("self", "")
+                if pdf_link.lower().endswith(".pdf") and await verify_pdf_url(pdf_link, client):
+                    print(f"[Zenodo] PDF URL found: {pdf_link}")
+                    return {"pdf_url": pdf_link, "host_type": "Zenodo", "source": "Zenodo"}
+        print("[Zenodo] No valid PDF link found")
+    except Exception as e:
+        print(f"[Zenodo] PDF fetch error: {e}")
+    return None
 
-
-
-async def get_openaire_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[OpenAIRE] Fetching PDF and metadata for DOI: {doi}")
-    url = f"https://api.openaire.eu/search/publications?doi:{quote(doi)}&format=json"
+async def get_figshare_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("figshare")
+    print(f"[Figshare] Fetching PDF for DOI: {doi}")
+    url = f"https://api.figshare.com/v2/articles/search?search_for={quote(doi)}"
     try:
         r = await client.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         data = r.json()
-        results = data.get("results", [])
-        if not results:
-            print("[OpenAIRE] No results found")
-            return None
-        pub = results[0]
-        fulltexts = pub.get("result", {}).get("fulltexts", [])
-        for ft in fulltexts:
-            if "url" in ft and ft.get("mediaType", "").lower() == "application/pdf":
-                pdf_url = ft["url"]
-                if await verify_pdf_url(pdf_url, client):
-                    print(f"[OpenAIRE] PDF URL found: {pdf_url}")
-                    metadata = {
-                        "title": pub.get("result", {}).get("title"),
-                        "authors": [{"name": a.get("name")} for a in pub.get("result", {}).get("creators", [])],
-                        "corresponding_email": None,
-                        "journal": pub.get("result", {}).get("publisher"),
-                        "year": pub.get("result", {}).get("publicationYear"),
-                    }
-                    return {"pdf_url": pdf_url, "host_type": "OpenAIRE", "source": "OpenAIRE", "metadata": metadata}
-                else:
-                    # Try to extract PDF from the page
-                    direct_pdf = await extract_pdf_from_page(pdf_url, client)
-                    if direct_pdf:
-                        print(f"[OpenAIRE] Direct PDF extracted from page: {direct_pdf}")
-                        metadata = {
-                            "title": pub.get("result", {}).get("title"),
-                            "authors": [{"name": a.get("name")} for a in pub.get("result", {}).get("creators", [])],
-                            "corresponding_email": None,
-                            "journal": pub.get("result", {}).get("publisher"),
-                            "year": pub.get("result", {}).get("publicationYear"),
-                        }
-                        return {"pdf_url": direct_pdf, "host_type": "OpenAIRE", "source": "OpenAIRE", "metadata": metadata}
-        print("[OpenAIRE] No valid PDF found")
+        items = data.get("items", [])
+        for item in items:
+            for f in item.get("files", []):
+                if f.get("name", "").lower().endswith(".pdf"):
+                    download_url = f.get("download_url")
+                    if download_url and await verify_pdf_url(download_url, client):
+                        print(f"[Figshare] PDF URL found: {download_url}")
+                        return {"pdf_url": download_url, "host_type": "Figshare", "source": "Figshare"}
+        print("[Figshare] No valid PDF link found")
     except Exception as e:
-        print(f"[OpenAIRE] PDF fetch error: {e}")
+        print(f"[Figshare] PDF fetch error: {e}")
     return None
 
-
-# 2. DOAJ metadata & PDF fetch
-async def get_doaj_metadata_and_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    url = f"https://doaj.org/api/v2/search/articles/doi:{quote(doi)}"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        results = data.get("results", [])
-        if not results:
-            print("[DOAJ] No results found")
-            return None
-        article = results[0].get("bibjson", {})
-        pdf_url = None
-        for link in article.get("link", []):
-            if link.get("url") and link.get("content_type") == "application/pdf":
-                pdf_url = link["url"]
-                break
-        if pdf_url:
-            if await verify_pdf_url(pdf_url, client):
-                print(f"[DOAJ] PDF URL found: {pdf_url}")
-                metadata = {
-                    "title": article.get("title"),
-                    "authors": [{"name": a.get("name")} for a in article.get("author", [])],
-                    "corresponding_email": None,
-                    "journal": article.get("journal", {}).get("title"),
-                    "year": article.get("year"),
-                }
-                return {"pdf_url": pdf_url, "host_type": "DOAJ", "source": "DOAJ", "metadata": metadata}
-            else:
-                # Try to extract PDF from the page
-                direct_pdf = await extract_pdf_from_page(pdf_url, client)
-                if direct_pdf:
-                    print(f"[DOAJ] Direct PDF extracted from page: {direct_pdf}")
-                    metadata = {
-                        "title": article.get("title"),
-                        "authors": [{"name": a.get("name")} for a in article.get("author", [])],
-                        "corresponding_email": None,
-                        "journal": article.get("journal", {}).get("title"),
-                        "year": article.get("year"),
-                    }
-                    return {"pdf_url": direct_pdf, "host_type": "DOAJ", "source": "DOAJ", "metadata": metadata}
-        print("[DOAJ] No PDF found")
-    except Exception as e:
-        print(f"[DOAJ] Fetch error: {e}")
-    return None
-
-# 3. ArXiv PDF fetch
 async def get_arxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("arxiv")
     # DOI for ArXiv papers usually start with "10.48550/arXiv."
     # Extract arXiv id from DOI if possible
     arxiv_prefix = "10.48550/arXiv."
@@ -509,8 +664,8 @@ async def get_arxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
         print(f"[ArXiv] PDF fetch error: {e}")
     return None
 
-# 4. bioRxiv PDF fetch via direct content link
 async def get_biorxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("biorxiv")
     # bioRxiv DOIs have prefix 10.1101
     if not doi.startswith("10.1101"):
         print("[bioRxiv] DOI not bioRxiv prefix, skipping")
@@ -529,9 +684,8 @@ async def get_biorxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[
         print(f"[bioRxiv] PDF fetch error: {e}")
     return None
 
-
-# 5. medRxiv PDF fetch via direct content link
 async def get_medrxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("medrxiv")
     if not doi.startswith("10.1101"):
         print("[medRxiv] DOI not medRxiv prefix, skipping")
         return None
@@ -549,34 +703,644 @@ async def get_medrxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[
         print(f"[medRxiv] PDF fetch error: {e}")
     return None
 
+async def get_chemrxiv_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("chemrxiv")
+    # ChemRxiv DOIs have prefix 10.26434
+    if not doi.startswith("10.26434"):
+        print("[ChemRxiv] DOI not ChemRxiv prefix, skipping")
+        return None
 
+    pdf_url = f"https://chemrxiv.org/engage/api-gateway/chemrxiv/assets/file/{doi}/content"
 
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[ChemRxiv] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "ChemRxiv", "source": "ChemRxiv"}
+        else:
+            print("[ChemRxiv] PDF not found")
+    except Exception as e:
+        print(f"[ChemRxiv] PDF fetch error: {e}")
+    return None
 
-# 6. Internet Archive PDF fetch (search metadata + check for pdf)
-async def get_internetarchive_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[Internet Archive] Fetching PDF for DOI: {doi}")
-    url = f"https://archive.org/advancedsearch.php?q=doi:{quote(doi)}&fl[]=identifier&fl[]=title&fl[]=downloads&fl[]=mediatype&output=json"
+async def get_f1000_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("f1000")
+    # F1000Research DOIs have prefix 10.12688
+    if not doi.startswith("10.12688"):
+        print("[F1000] DOI not F1000 prefix, skipping")
+        return None
+
+    pdf_url = f"https://f1000research.com/articles/{doi.split('/')[-1]}/pdf"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[F1000] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "F1000", "source": "F1000"}
+        else:
+            print("[F1000] PDF not found")
+    except Exception as e:
+        print(f"[F1000] PDF fetch error: {e}")
+    return None
+
+async def get_elife_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("elife")
+    # eLife DOIs have prefix 10.7554
+    if not doi.startswith("10.7554"):
+        print("[eLife] DOI not eLife prefix, skipping")
+        return None
+
+    pdf_url = f"https://elifesciences.org/articles/{doi.split('/')[-1]}/pdf"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[eLife] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "eLife", "source": "eLife"}
+        else:
+            print("[eLife] PDF not found")
+    except Exception as e:
+        print(f"[eLife] PDF fetch error: {e}")
+    return None
+
+async def get_cell_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("cell")
+    # Cell Press DOIs have prefix 10.1016
+    if not doi.startswith("10.1016"):
+        print("[Cell] DOI not Cell Press prefix, skipping")
+        return None
+
+    pdf_url = f"https://www.cell.com/article/{doi}/pdf"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[Cell] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "Cell", "source": "Cell"}
+        else:
+            print("[Cell] PDF not found")
+    except Exception as e:
+        print(f"[Cell] PDF fetch error: {e}")
+    return None
+
+async def get_frontiers_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("frontiers")
+    # Frontiers DOIs have prefix 10.3389
+    if not doi.startswith("10.3389"):
+        print("[Frontiers] DOI not Frontiers prefix, skipping")
+        return None
+
+    pdf_url = f"https://www.frontiersin.org/articles/{doi}/pdf"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[Frontiers] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "Frontiers", "source": "Frontiers"}
+        else:
+            print("[Frontiers] PDF not found")
+    except Exception as e:
+        print(f"[Frontiers] PDF fetch error: {e}")
+    return None
+
+async def get_mdpi_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("mdpi")
+    # MDPI DOIs have prefix 10.3390
+    if not doi.startswith("10.3390"):
+        print("[MDPI] DOI not MDPI prefix, skipping")
+        return None
+
+    pdf_url = f"https://www.mdpi.com/{doi.split('/')[-1]}/pdf"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[MDPI] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "MDPI", "source": "MDPI"}
+        else:
+            print("[MDPI] PDF not found")
+    except Exception as e:
+        print(f"[MDPI] PDF fetch error: {e}")
+    return None
+
+async def get_hindawi_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("hindawi")
+    # Hindawi DOIs have prefix 10.1155
+    if not doi.startswith("10.1155"):
+        print("[Hindawi] DOI not Hindawi prefix, skipping")
+        return None
+
+    pdf_url = f"https://downloads.hindawi.com/journals/{doi.split('/')[-2]}/{doi.split('/')[-1]}.pdf"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[Hindawi] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "Hindawi", "source": "Hindawi"}
+        else:
+            print("[Hindawi] PDF not found")
+    except Exception as e:
+        print(f"[Hindawi] PDF fetch error: {e}")
+    return None
+
+async def get_copernicus_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("copernicus")
+    # Copernicus DOIs have prefix 10.5194
+    if not doi.startswith("10.5194"):
+        print("[Copernicus] DOI not Copernicus prefix, skipping")
+        return None
+
+    pdf_url = f"https://{doi.split('/')[-2]}.copernicus.org/articles/{doi.split('/')[-1]}.pdf"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[Copernicus] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "Copernicus", "source": "Copernicus"}
+        else:
+            print("[Copernicus] PDF not found")
+    except Exception as e:
+        print(f"[Copernicus] PDF fetch error: {e}")
+    return None
+
+async def get_iop_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("iop")
+    # IOP DOIs have prefix 10.1088
+    if not doi.startswith("10.1088"):
+        print("[IOP] DOI not IOP prefix, skipping")
+        return None
+
+    pdf_url = f"https://iopscience.iop.org/article/{doi}/pdf"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[IOP] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "IOP", "source": "IOP"}
+        else:
+            print("[IOP] PDF not found")
+    except Exception as e:
+        print(f"[IOP] PDF fetch error: {e}")
+    return None
+
+async def get_aps_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("aps")
+    # APS DOIs have prefix 10.1103
+    if not doi.startswith("10.1103"):
+        print("[APS] DOI not APS prefix, skipping")
+        return None
+
+    pdf_url = f"https://journals.aps.org/{doi.split('/')[-2]}/pdf/{doi.split('/')[-1]}"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[APS] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "APS", "source": "APS"}
+        else:
+            print("[APS] PDF not found")
+    except Exception as e:
+        print(f"[APS] PDF fetch error: {e}")
+    return None
+
+async def get_aip_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("aip")
+    # AIP DOIs have prefix 10.1063
+    if not doi.startswith("10.1063"):
+        print("[AIP] DOI not AIP prefix, skipping")
+        return None
+
+    pdf_url = f"https://aip.scitation.org/doi/pdf/{doi}"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[AIP] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "AIP", "source": "AIP"}
+        else:
+            print("[AIP] PDF not found")
+    except Exception as e:
+        print(f"[AIP] PDF fetch error: {e}")
+    return None
+
+async def get_rsc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("rsc")
+    # RSC DOIs have prefix 10.1039
+    if not doi.startswith("10.1039"):
+        print("[RSC] DOI not RSC prefix, skipping")
+        return None
+
+    pdf_url = f"https://pubs.rsc.org/en/content/articlepdf/{doi}"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[RSC] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "RSC", "source": "RSC"}
+        else:
+            print("[RSC] PDF not found")
+    except Exception as e:
+        print(f"[RSC] PDF fetch error: {e}")
+    return None
+
+async def get_acs_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("acs")
+    # ACS DOIs have prefix 10.1021
+    if not doi.startswith("10.1021"):
+        print("[ACS] DOI not ACS prefix, skipping")
+        return None
+
+    pdf_url = f"https://pubs.acs.org/doi/pdf/{doi}"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[ACS] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "ACS", "source": "ACS"}
+        else:
+            print("[ACS] PDF not found")
+    except Exception as e:
+        print(f"[ACS] PDF fetch error: {e}")
+    return None
+
+async def get_ieee_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("ieee")
+    # IEEE DOIs have prefix 10.1109
+    if not doi.startswith("10.1109"):
+        print("[IEEE] DOI not IEEE prefix, skipping")
+        return None
+
+    pdf_url = f"https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber={doi.split('/')[-1]}"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[IEEE] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "IEEE", "source": "IEEE"}
+        else:
+            print("[IEEE] PDF not found")
+    except Exception as e:
+        print(f"[IEEE] PDF fetch error: {e}")
+    return None
+
+async def get_acm_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("acm")
+    # ACM DOIs have prefix 10.1145
+    if not doi.startswith("10.1145"):
+        print("[ACM] DOI not ACM prefix, skipping")
+        return None
+
+    pdf_url = f"https://dl.acm.org/doi/pdf/{doi}"
+
+    try:
+        r = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[ACM] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "ACM", "source": "ACM"}
+        else:
+            print("[ACM] PDF not found")
+    except Exception as e:
+        print(f"[ACM] PDF fetch error: {e}")
+    return None
+
+async def get_springer_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("springer")
+    print(f"[Springer] Fetching PDF for DOI: {doi}")
+    url = f"https://link.springer.com/content/pdf/{quote(doi)}.pdf"
+    try:
+        # Check if PDF exists
+        r = await client.head(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[Springer] PDF URL found: {url}")
+            return {"pdf_url": url, "host_type": "Springer", "source": "Springer"}
+        else:
+            # Try to extract PDF from the article page
+            article_url = f"https://link.springer.com/article/{quote(doi)}"
+            direct_pdf = await extract_pdf_from_page(article_url, client)
+            if direct_pdf:
+                print(f"[Springer] Direct PDF extracted from page: {direct_pdf}")
+                return {"pdf_url": direct_pdf, "host_type": "Springer", "source": "Springer"}
+            
+            print("[Springer] PDF not found")
+    except Exception as e:
+        print(f"[Springer] PDF fetch error: {e}")
+    return None
+
+async def get_elsevier_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("elsevier")
+    print(f"[Elsevier] Fetching PDF for DOI: {doi}")
+    url = f"https://www.sciencedirect.com/science/article/pii/{quote(doi)}"
+    try:
+        # Try to extract PDF from the article page
+        direct_pdf = await extract_pdf_from_page(url, client)
+        if direct_pdf:
+            print(f"[Elsevier] Direct PDF extracted from page: {direct_pdf}")
+            return {"pdf_url": direct_pdf, "host_type": "Elsevier", "source": "Elsevier"}
+        
+        print("[Elsevier] No valid PDF link found")
+    except Exception as e:
+        print(f"[Elsevier] PDF fetch error: {e}")
+    return None
+
+async def get_wiley_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("wiley")
+    print(f"[Wiley] Fetching PDF for DOI: {doi}")
+    url = f"https://onlinelibrary.wiley.com/doi/pdfdirect/{quote(doi)}"
+    try:
+        # Check if PDF exists
+        r = await client.head(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[Wiley] PDF URL found: {url}")
+            return {"pdf_url": url, "host_type": "Wiley", "source": "Wiley"}
+        else:
+            # Try to extract PDF from the article page
+            article_url = f"https://onlinelibrary.wiley.com/doi/{quote(doi)}"
+            direct_pdf = await extract_pdf_from_page(article_url, client)
+            if direct_pdf:
+                print(f"[Wiley] Direct PDF extracted from page: {direct_pdf}")
+                return {"pdf_url": direct_pdf, "host_type": "Wiley", "source": "Wiley"}
+            
+            print("[Wiley] PDF not found")
+    except Exception as e:
+        print(f"[Wiley] PDF fetch error: {e}")
+    return None
+
+async def get_nature_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("nature")
+    print(f"[Nature] Fetching PDF for DOI: {doi}")
+    url = f"https://www.nature.com/articles/{quote(doi)}.pdf"
+    try:
+        # Check if PDF exists
+        r = await client.head(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[Nature] PDF URL found: {url}")
+            return {"pdf_url": url, "host_type": "Nature", "source": "Nature"}
+        else:
+            # Try to extract PDF from the article page
+            article_url = f"https://www.nature.com/articles/{quote(doi)}"
+            direct_pdf = await extract_pdf_from_page(article_url, client)
+            if direct_pdf:
+                print(f"[Nature] Direct PDF extracted from page: {direct_pdf}")
+                return {"pdf_url": direct_pdf, "host_type": "Nature", "source": "Nature"}
+            
+            print("[Nature] PDF not found")
+    except Exception as e:
+        print(f"[Nature] PDF fetch error: {e}")
+    return None
+
+async def get_science_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("science")
+    print(f"[Science] Fetching PDF for DOI: {doi}")
+    url = f"https://www.science.org/doi/pdf/{quote(doi)}"
+    try:
+        # Check if PDF exists
+        r = await client.head(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            print(f"[Science] PDF URL found: {url}")
+            return {"pdf_url": url, "host_type": "Science", "source": "Science"}
+        else:
+            # Try to extract PDF from the article page
+            article_url = f"https://www.science.org/doi/{quote(doi)}"
+            direct_pdf = await extract_pdf_from_page(article_url, client)
+            if direct_pdf:
+                print(f"[Science] Direct PDF extracted from page: {direct_pdf}")
+                return {"pdf_url": direct_pdf, "host_type": "Science", "source": "Science"}
+            
+            print("[Science] PDF not found")
+    except Exception as e:
+        print(f"[Science] PDF fetch error: {e}")
+    return None
+
+async def get_jstor_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("jstor")
+    print(f"[JSTOR] Fetching PDF for DOI: {doi}")
+    url = f"https://www.jstor.org/action/doBasicSearch?Query={quote(doi)}"
     try:
         r = await client.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
-        results = r.json().get("response", {}).get("docs", [])
-        for doc in results:
-            identifier = doc.get("identifier")
-            if identifier:
-                pdf_url = f"https://archive.org/download/{identifier}/{identifier}.pdf"
-                # Check PDF existence
-                head = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
-                if head.status_code == 200:
-                    print(f"[Internet Archive] PDF URL found: {pdf_url}")
-                    return {"pdf_url": pdf_url, "host_type": "Internet Archive", "source": "Internet Archive"}
-        print("[Internet Archive] No valid PDF found")
+        content = r.text
+        
+        # Look for direct PDF links in the page
+        patterns = [
+            r'href=["\']([^"\']*\.pdf)["\']',
+            r'["\']([^"\']*\.pdf)["\']',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            for match in matches:
+                if match.startswith("/"):
+                    # Convert relative URL to absolute
+                    base_url = "https://www.jstor.org"
+                    match = base_url + match
+                elif not match.startswith("http"):
+                    # Convert relative URL to absolute
+                    base_url = "https://www.jstor.org"
+                    match = base_url + "/" + match
+                
+                # Verify it's a PDF
+                if await verify_pdf_url(match, client):
+                    print(f"[JSTOR] PDF URL found: {match}")
+                    return {"pdf_url": match, "host_type": "JSTOR", "source": "JSTOR"}
+        
+        print("[JSTOR] No valid PDF link found")
     except Exception as e:
-        print(f"[Internet Archive] PDF fetch error: {e}")
+        print(f"[JSTOR] PDF fetch error: {e}")
     return None
 
+async def get_ssrn_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("ssrn")
+    print(f"[SSRN] Fetching PDF for DOI: {doi}")
+    url = f"https://papers.ssrn.com/sol3/Delivery.cfm/{quote(doi)}"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        content = r.text
+        
+        # Look for direct PDF links in the page
+        patterns = [
+            r'href=["\']([^"\']*\.pdf)["\']',
+            r'["\']([^"\']*\.pdf)["\']',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            for match in matches:
+                if match.startswith("/"):
+                    # Convert relative URL to absolute
+                    base_url = "https://papers.ssrn.com"
+                    match = base_url + match
+                elif not match.startswith("http"):
+                    # Convert relative URL to absolute
+                    base_url = "https://papers.ssrn.com"
+                    match = base_url + "/" + match
+                
+                # Verify it's a PDF
+                if await verify_pdf_url(match, client):
+                    print(f"[SSRN] PDF URL found: {match}")
+                    return {"pdf_url": match, "host_type": "SSRN", "source": "SSRN"}
+        
+        print("[SSRN] No valid PDF link found")
+    except Exception as e:
+        print(f"[SSRN] PDF fetch error: {e}")
+    return None
 
-# 7. PLOS API for metadata and PDFs
+async def get_repec_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("repec")
+    print(f"[RePEc] Fetching PDF for DOI: {doi}")
+    url = f"https://api.repec.org/cgibin/getref?doi={quote(doi)}"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        content = r.text
+        
+        # Look for direct PDF links in the page
+        patterns = [
+            r'href=["\']([^"\']*\.pdf)["\']',
+            r'["\']([^"\']*\.pdf)["\']',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            for match in matches:
+                if match.startswith("/"):
+                    # Convert relative URL to absolute
+                    base_url = "https://ideas.repec.org"
+                    match = base_url + match
+                elif not match.startswith("http"):
+                    # Convert relative URL to absolute
+                    base_url = "https://ideas.repec.org"
+                    match = base_url + "/" + match
+                
+                # Verify it's a PDF
+                if await verify_pdf_url(match, client):
+                    print(f"[RePEc] PDF URL found: {match}")
+                    return {"pdf_url": match, "host_type": "RePEc", "source": "RePEc"}
+        
+        print("[RePEc] No valid PDF link found")
+    except Exception as e:
+        print(f"[RePEc] PDF fetch error: {e}")
+    return None
+
+async def get_pmc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("pmc")
+    print(f"[PMC] Fetching PDF for DOI: {doi}")
+    # First, get the PMC ID from the DOI
+    url = f"https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids={quote(doi)}&format=json"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        records = data.get("records", [])
+        if not records:
+            print("[PMC] No PMC ID found for DOI")
+            return None
+        
+        pmc_id = records[0].get("pmcid")
+        if not pmc_id:
+            print("[PMC] No PMC ID found in record")
+            return None
+        
+        # Try direct PDF URL
+        pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc_id}/pdf/{pmc_id}.pdf"
+        if await verify_pdf_url(pdf_url, client):
+            print(f"[PMC] PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "PMC", "source": "PMC"}
+        
+        # Try alternative PDF URL
+        pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc_id}/pdf"
+        if await verify_pdf_url(pdf_url, client):
+            print(f"[PMC] Alternative PDF URL found: {pdf_url}")
+            return {"pdf_url": pdf_url, "host_type": "PMC", "source": "PMC"}
+        
+        # Try to extract PDF from the article page
+        article_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc_id}"
+        direct_pdf = await extract_pdf_from_page(article_url, client)
+        if direct_pdf:
+            print(f"[PMC] Direct PDF extracted from page: {direct_pdf}")
+            return {"pdf_url": direct_pdf, "host_type": "PMC", "source": "PMC"}
+        
+        print("[PMC] No valid PDF link found")
+    except Exception as e:
+        print(f"[PMC] PDF fetch error: {e}")
+    return None
+
+async def get_citeseerx_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("citeseerx")
+    print(f"[CiteSeerX] Fetching PDF for DOI: {doi}")
+    url = f"http://citeseerx.ist.psu.edu/search?q={quote(doi)}"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        content = r.text
+        
+        # Look for direct PDF links in the page
+        patterns = [
+            r'href=["\']([^"\']*\.pdf)["\']',
+            r'["\']([^"\']*\.pdf)["\']',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            for match in matches:
+                if match.startswith("/"):
+                    # Convert relative URL to absolute
+                    base_url = "http://citeseerx.ist.psu.edu"
+                    match = base_url + match
+                elif not match.startswith("http"):
+                    # Convert relative URL to absolute
+                    base_url = "http://citeseerx.ist.psu.edu"
+                    match = base_url + "/" + match
+                
+                # Verify it's a PDF
+                if await verify_pdf_url(match, client):
+                    print(f"[CiteSeerX] PDF URL found: {match}")
+                    return {"pdf_url": match, "host_type": "CiteSeerX", "source": "CiteSeerX"}
+        
+        print("[CiteSeerX] No valid PDF link found")
+    except Exception as e:
+        print(f"[CiteSeerX] PDF fetch error: {e}")
+    return None
+
+async def get_researchgate_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("researchgate")
+    print(f"[ResearchGate] Fetching PDF for DOI: {doi}")
+    url = f"https://www.researchgate.net/publication/{quote(doi)}"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        content = r.text
+        
+        # Look for direct PDF links in the page
+        patterns = [
+            r'href=["\']([^"\']*\.pdf)["\']',
+            r'["\']([^"\']*\.pdf)["\']',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            for match in matches:
+                if match.startswith("/"):
+                    # Convert relative URL to absolute
+                    base_url = "https://www.researchgate.net"
+                    match = base_url + match
+                elif not match.startswith("http"):
+                    # Convert relative URL to absolute
+                    base_url = "https://www.researchgate.net"
+                    match = base_url + "/" + match
+                
+                # Verify it's a PDF
+                if await verify_pdf_url(match, client):
+                    print(f"[ResearchGate] PDF URL found: {match}")
+                    return {"pdf_url": match, "host_type": "ResearchGate", "source": "ResearchGate"}
+        
+        print("[ResearchGate] No valid PDF link found")
+    except Exception as e:
+        print(f"[ResearchGate] PDF fetch error: {e}")
+    return None
+
 async def get_plos_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("plos")
     url = f"http://api.plos.org/search?q=doi:{quote(doi)}&fl=id,title,author,publication_date,journal&wt=json"
     try:
         r = await client.get(url, timeout=REQUEST_TIMEOUT)
@@ -629,258 +1393,8 @@ async def get_plos_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> Opti
         print(f"[PLOS] Fetch error: {e}")
     return None
 
-
-
-
-# 2. Crossref Event Data - Metadata only, no API key required
-async def get_crossref_event_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[Crossref Event Data] Fetching event metadata for DOI: {doi}")
-    url = f"https://api.eventdata.crossref.org/v1/events?obj-id={quote(doi)}"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        metadata = {"title": None, "authors": []}
-        if data.get("message", {}).get("events"):
-            metadata["title"] = f"Events count: {len(data['message']['events'])}"
-        print(f"[Crossref Event Data] Metadata fetched: {metadata}")
-        return metadata
-    except Exception as e:
-        print(f"[Crossref Event Data] Fetch error: {e}")
-        return None
-
-
-# 3. NLM PubMed/PMC Metadata - no key, IP whitelist (simple metadata fetch)
-async def get_nlm_pubmed_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[NLM PubMed] Fetching metadata for DOI: {doi}")
-    url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={quote(doi)}[DOI]&retmode=json"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        idlist = data.get("esearchresult", {}).get("idlist", [])
-        if not idlist:
-            print("[NLM PubMed] No PMID found for DOI")
-            return None
-        pmid = idlist[0]
-        summary_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id={pmid}&retmode=json"
-        r2 = await client.get(summary_url, timeout=REQUEST_TIMEOUT)
-        r2.raise_for_status()
-        summary = r2.json()
-        doc = summary.get("result", {}).get(pmid, {})
-        metadata = {
-            "title": doc.get("title"),
-            "authors": [{"name": a.get("name")} for a in doc.get("authors", [])] if doc.get("authors") else [],
-            "pubdate": doc.get("pubdate"),
-        }
-        print(f"[NLM PubMed] Metadata fetched: {metadata}")
-        return metadata
-    except Exception as e:
-        print(f"[NLM PubMed] Fetch error: {e}")
-        return None
-
-
-# 4. Dryad Metadata (open access)
-async def get_dryad_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[Dryad] Fetching metadata for DOI: {doi}")
-    url = f"https://datadryad.org/api/v2/package/{quote(doi)}"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        if r.status_code == 404:
-            print("[Dryad] No data found (404)")
-            return None
-        r.raise_for_status()
-        data = r.json()
-        metadata = {
-            "title": data.get("title"),
-            "authors": [{"name": a.get("full_name")} for a in data.get("authors", [])],
-            "year": data.get("publication_year"),
-        }
-        print(f"[Dryad] Metadata fetched: {metadata}")
-        return metadata
-    except Exception as e:
-        print(f"[Dryad] Fetch error: {e}")
-        return None
-
-
-
-# 6. OpenAIRE Datasets/Projects Metadata (no key)
-async def get_openaire_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[OpenAIRE] Fetching metadata for DOI: {doi}")
-    url = f"https://api.openaire.eu/search/publications?doi={quote(doi)}&format=json"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        results = data.get("result", {}).get("results", [])
-        if not results:
-            print("[OpenAIRE] No results found")
-            return None
-        item = results[0]
-        metadata = {
-            "title": item.get("title"),
-            "authors": [{"name": a} for a in item.get("authors", [])],
-            "year": item.get("publicationYear"),
-        }
-        print(f"[OpenAIRE] Metadata fetched: {metadata}")
-        return metadata
-    except Exception as e:
-        print(f"[OpenAIRE] Fetch error: {e}")
-        return None
-
-
-# 7. Internet Archive Scholar Metadata (no key)
-async def get_internetarchive_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[Internet Archive] Fetching metadata for DOI: {doi}")
-    url = f"https://archive.org/metadata/{quote(doi)}"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        metadata = {
-            "title": data.get("metadata", {}).get("title"),
-            "authors": [{"name": a} for a in data.get("metadata", {}).get("creator", [])] if isinstance(data.get("metadata", {}).get("creator"), list) else [],
-        }
-        print(f"[Internet Archive] Metadata fetched: {metadata}")
-        return metadata
-    except Exception as e:
-        print(f"[Internet Archive] Fetch error: {e}")
-        return None
-
-
-# 8. Europe PMC Grants (no key) — typically metadata only
-async def get_europepmc_grants_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[Europe PMC Grants] Fetching metadata for DOI: {doi}")
-    url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={quote(doi)}&format=json"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        results = data.get("resultList", {}).get("result", [])
-        if not results:
-            print("[Europe PMC Grants] No results found")
-            return None
-
-        # pick the first grant-related or general entry
-        item = next((res for res in results if res.get("pubType") == "Grant"), results[0])
-
-        metadata = {
-            "title": item.get("title"),
-            "authors": [{"name": a} for a in item.get("authorString", "").split(", ") if a],
-            "pubType": item.get("pubType"),
-            "source": "EuropePMC-Grants"
-        }
-        print(f"[Europe PMC Grants] Metadata fetched: {metadata}")
-        return metadata
-
-    except Exception as e:
-        print(f"[Europe PMC Grants] Fetch error: {e}")
-        return None
-
-
-# 15. Wikidata SPARQL Query (no key)
-async def get_wikidata_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[Wikidata SPARQL] Fetching metadata for DOI: {doi}")
-    query = f"""
-    SELECT ?item ?itemLabel WHERE {{
-      ?item wdt:P356 "{doi}".
-      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-    }}
-    """
-    url = "https://query.wikidata.org/sparql"
-    headers = {"Accept": "application/sparql-results+json"}
-    try:
-        r = await client.get(url, params={"query": query}, headers=headers, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        bindings = data.get("results", {}).get("bindings", [])
-        if not bindings:
-            print("[Wikidata SPARQL] No results found")
-            return None
-        item = bindings[0].get("itemLabel", {}).get("value")
-        metadata = {"title": item, "authors": []}
-        print(f"[Wikidata SPARQL] Metadata fetched: {metadata}")
-        return metadata
-    except Exception as e:
-        print(f"[Wikidata SPARQL] Fetch error: {e}")
-        return None
-
-
-# 16. Google Books API (API key required)
-async def get_google_books_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[Google Books] Fetching metadata for DOI: {doi}")
-    if not GOOGLE_BOOKS_API_KEY:
-        print("[Google Books] API key missing, skipping")
-        return None
-    if not check_and_increment_google_books():
-        print("[Google Books] Daily query limit reached, skipping")
-        return None
-
-    url = f"https://www.googleapis.com/books/v1/volumes?q=doi:{quote(doi)}&key={GOOGLE_BOOKS_API_KEY}"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("items", [])
-        if not items:
-            print("[Google Books] No items found")
-            return None
-        volume_info = items[0].get("volumeInfo", {})
-        metadata = {
-            "title": volume_info.get("title"),
-            "authors": [{"name": a} for a in volume_info.get("authors", [])],
-            "publishedDate": volume_info.get("publishedDate"),
-        }
-        print(f"[Google Books] Metadata fetched: {metadata}")
-        return metadata
-    except Exception as e:
-        print(f"[Google Books] Fetch error: {e}")
-        return None
-
-
-# --- Modified EuropePMC PDF fetcher ---
-async def get_europepmc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[EuropePMC] Fetching PDF for DOI: {doi}")
-    url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=doi:{quote(doi)}&format=json"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        results = r.json().get("resultList", {}).get("result", [])
-
-        for result in results:
-            full_text_urls = result.get("fullTextUrlList", {}).get("fullTextUrl", [])
-            for full_text_url in full_text_urls:
-                if full_text_url.get("documentStyle") == "pdf" and full_text_url.get("availability") == "OPEN_ACCESS":
-                    pdf_link = full_text_url.get("url")
-                    if await verify_pdf_url(pdf_link, client):
-                        host_type = (
-                            "EuropePMC Preprints"
-                            if result.get("pubType", "").lower() == "preprint"
-                            else "EuropePMC"
-                        )
-                        print(f"[EuropePMC] PDF URL found: {pdf_link} (Type: {host_type})")
-                        return {"pdf_url": pdf_link, "host_type": host_type, "source": host_type}
-                    else:
-                        # Try to extract PDF from the page
-                        direct_pdf = await extract_pdf_from_page(pdf_link, client)
-                        if direct_pdf:
-                            host_type = (
-                                "EuropePMC Preprints"
-                                if result.get("pubType", "").lower() == "preprint"
-                                else "EuropePMC"
-                            )
-                            print(f"[EuropePMC] Direct PDF extracted from page: {direct_pdf} (Type: {host_type})")
-                            return {"pdf_url": direct_pdf, "host_type": host_type, "source": host_type}
-
-        print("[EuropePMC] No valid PDF link found")
-    except Exception as e:
-        print(f"[EuropePMC] PDF fetch error: {e}")
-    return None
-
-
-
-
 async def get_share_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, str]]:
+    await rate_limit("share")
     print(f"[Share API] Fetching PDF for DOI: {doi}")
     base_url = "https://share.osf.io/api/v2/search/"
     params = {
@@ -940,6 +1454,254 @@ async def get_share_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
         print(f"[Share API] PDF fetch error: {e}")
     return None
 
+async def get_internetarchive_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("internetarchive")
+    print(f"[Internet Archive] Fetching PDF for DOI: {doi}")
+    url = f"https://archive.org/advancedsearch.php?q=doi:{quote(doi)}&fl[]=identifier&fl[]=title&fl[]=downloads&fl[]=mediatype&output=json"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        results = r.json().get("response", {}).get("docs", [])
+        for doc in results:
+            identifier = doc.get("identifier")
+            if identifier:
+                pdf_url = f"https://archive.org/download/{identifier}/{identifier}.pdf"
+                # Check PDF existence
+                head = await client.head(pdf_url, timeout=REQUEST_TIMEOUT)
+                if head.status_code == 200:
+                    print(f"[Internet Archive] PDF URL found: {pdf_url}")
+                    return {"pdf_url": pdf_url, "host_type": "Internet Archive", "source": "Internet Archive"}
+        print("[Internet Archive] No valid PDF found")
+    except Exception as e:
+        print(f"[Internet Archive] PDF fetch error: {e}")
+    return None
+
+async def get_hal_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("hal")
+    print(f"[HAL] Fetching PDF for DOI: {doi}")
+    url = f"https://api.archives-ouvertes.fr/search/?q=doiId_s:{quote(doi)}&fl=doiId_s,uri_s,fileMain_s,title_s,authFullName_s&wt=json"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        docs = data.get("response", {}).get("docs", [])
+        if not docs:
+            print("[HAL] No results found")
+            return None
+        
+        doc = docs[0]
+        pdf_url = doc.get("fileMain_s")
+        if pdf_url:
+            if await verify_pdf_url(pdf_url, client):
+                print(f"[HAL] PDF URL found: {pdf_url}")
+                return {"pdf_url": pdf_url, "host_type": "HAL", "source": "HAL"}
+            else:
+                # Try to extract PDF from the page
+                direct_pdf = await extract_pdf_from_page(pdf_url, client)
+                if direct_pdf:
+                    print(f"[HAL] Direct PDF extracted from page: {direct_pdf}")
+                    return {"pdf_url": direct_pdf, "host_type": "HAL", "source": "HAL"}
+        
+        print("[HAL] No valid PDF link found")
+    except Exception as e:
+        print(f"[HAL] PDF fetch error: {e}")
+    return None
+
+async def get_openaire_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("openaire")
+    print(f"[OpenAIRE] Fetching PDF and metadata for DOI: {doi}")
+    url = f"https://api.openaire.eu/search/publications?doi:{quote(doi)}&format=json"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results", [])
+        if not results:
+            print("[OpenAIRE] No results found")
+            return None
+        pub = results[0]
+        fulltexts = pub.get("result", {}).get("fulltexts", [])
+        for ft in fulltexts:
+            if "url" in ft and ft.get("mediaType", "").lower() == "application/pdf":
+                pdf_url = ft["url"]
+                if await verify_pdf_url(pdf_url, client):
+                    print(f"[OpenAIRE] PDF URL found: {pdf_url}")
+                    metadata = {
+                        "title": pub.get("result", {}).get("title"),
+                        "authors": [{"name": a.get("name")} for a in pub.get("result", {}).get("creators", [])],
+                        "corresponding_email": None,
+                        "journal": pub.get("result", {}).get("publisher"),
+                        "year": pub.get("result", {}).get("publicationYear"),
+                    }
+                    return {"pdf_url": pdf_url, "host_type": "OpenAIRE", "source": "OpenAIRE", "metadata": metadata}
+                else:
+                    # Try to extract PDF from the page
+                    direct_pdf = await extract_pdf_from_page(pdf_url, client)
+                    if direct_pdf:
+                        print(f"[OpenAIRE] Direct PDF extracted from page: {direct_pdf}")
+                        metadata = {
+                            "title": pub.get("result", {}).get("title"),
+                            "authors": [{"name": a.get("name")} for a in pub.get("result", {}).get("creators", [])],
+                            "corresponding_email": None,
+                            "journal": pub.get("result", {}).get("publisher"),
+                            "year": pub.get("result", {}).get("publicationYear"),
+                        }
+                        return {"pdf_url": direct_pdf, "host_type": "OpenAIRE", "source": "OpenAIRE", "metadata": metadata}
+        print("[OpenAIRE] No valid PDF found")
+    except Exception as e:
+        print(f"[OpenAIRE] PDF fetch error: {e}")
+    return None
+
+async def get_doaj_metadata_and_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+    await rate_limit("doaj")
+    url = f"https://doaj.org/api/v2/search/articles/doi:{quote(doi)}"
+    try:
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results", [])
+        if not results:
+            print("[DOAJ] No results found")
+            return None
+        article = results[0].get("bibjson", {})
+        pdf_url = None
+        for link in article.get("link", []):
+            if link.get("url") and link.get("content_type") == "application/pdf":
+                pdf_url = link["url"]
+                break
+        if pdf_url:
+            if await verify_pdf_url(pdf_url, client):
+                print(f"[DOAJ] PDF URL found: {pdf_url}")
+                metadata = {
+                    "title": article.get("title"),
+                    "authors": [{"name": a.get("name")} for a in article.get("author", [])],
+                    "corresponding_email": None,
+                    "journal": article.get("journal", {}).get("title"),
+                    "year": article.get("year"),
+                }
+                return {"pdf_url": pdf_url, "host_type": "DOAJ", "source": "DOAJ", "metadata": metadata}
+            else:
+                # Try to extract PDF from the page
+                direct_pdf = await extract_pdf_from_page(pdf_url, client)
+                if direct_pdf:
+                    print(f"[DOAJ] Direct PDF extracted from page: {direct_pdf}")
+                    metadata = {
+                        "title": article.get("title"),
+                        "authors": [{"name": a.get("name")} for a in article.get("author", [])],
+                        "corresponding_email": None,
+                        "journal": article.get("journal", {}).get("title"),
+                        "year": article.get("year"),
+                    }
+                    return {"pdf_url": direct_pdf, "host_type": "DOAJ", "source": "DOAJ", "metadata": metadata}
+        print("[DOAJ] No PDF found")
+    except Exception as e:
+        print(f"[DOAJ] Fetch error: {e}")
+    return None
+
+# Priority-based source selection
+# Higher priority sources are checked first
+PDF_SOURCES_PRIORITY = [
+    # Preprint servers (highest priority for quick access)
+    "arxiv", "biorxiv", "medrxiv", "chemrxiv", "f1000", "elife",
+    
+    # Open access repositories
+    "unpaywall", "europepmc", "pmc", "zenodo", "figshare", "doaj", "openaire",
+    
+    # Publisher-specific (open access)
+    "plos", "frontiers", "mdpi", "hindawi", "copernicus", "elife", "f1000",
+    
+    # Institutional repositories
+    "base", "hal", "internetarchive",
+    
+    # General DOI resolution
+    "doi",
+    
+    # Publisher-specific (may have paywalls)
+    "springer", "elsevier", "wiley", "nature", "science", "cell",
+    "iop", "aps", "aip", "rsc", "acs", "ieee", "acm",
+    
+    # Academic social networks
+    "researchgate", "ssrn", "repec", "citeseerx",
+    
+    # Archives
+    "jstor", "share",
+]
+
+METADATA_SOURCES_PRIORITY = [
+    # Primary metadata sources
+    "crossref", "openalex", "semantic_scholar", "pubmed",
+    
+    # Repository metadata
+    "openaire", "doaj", "dryad", "internetarchive",
+    
+    # Specialized metadata
+    "wikidata", "google_books",
+]
+
+# Map source names to functions
+PDF_SOURCE_FUNCTIONS = {
+    "doi": get_pdf_url_from_doi,
+    "unpaywall": get_unpaywall_pdf,
+    "europepmc": get_europepmc_pdf,
+    "base": get_base_pdf,
+    "zenodo": get_zenodo_pdf,
+    "figshare": get_figshare_pdf,
+    "arxiv": get_arxiv_pdf,
+    "biorxiv": get_biorxiv_pdf,
+    "medrxiv": get_medrxiv_pdf,
+    "chemrxiv": get_chemrxiv_pdf,
+    "f1000": get_f1000_pdf,
+    "elife": get_elife_pdf,
+    "cell": get_cell_pdf,
+    "frontiers": get_frontiers_pdf,
+    "mdpi": get_mdpi_pdf,
+    "hindawi": get_hindawi_pdf,
+    "copernicus": get_copernicus_pdf,
+    "iop": get_iop_pdf,
+    "aps": get_aps_pdf,
+    "aip": get_aip_pdf,
+    "rsc": get_rsc_pdf,
+    "acs": get_acs_pdf,
+    "ieee": get_ieee_pdf,
+    "acm": get_acm_pdf,
+    "springer": get_springer_pdf,
+    "elsevier": get_elsevier_pdf,
+    "wiley": get_wiley_pdf,
+    "nature": get_nature_pdf,
+    "science": get_science_pdf,
+    "jstor": get_jstor_pdf,
+    "plos": get_plos_pdf_and_metadata,
+    "ssrn": get_ssrn_pdf,
+    "repec": get_repec_pdf,
+    "pmc": get_pmc_pdf,
+    "citeseerx": get_citeseerx_pdf,
+    "researchgate": get_researchgate_pdf,
+    "share": get_share_pdf,
+    "internetarchive": get_internetarchive_pdf,
+    "hal": get_hal_pdf,
+    "openaire": get_openaire_pdf_and_metadata,
+    "doaj": get_doaj_metadata_and_pdf,
+}
+
+METADATA_SOURCE_FUNCTIONS = {
+    "crossref": get_crossref_metadata,
+    "openalex": get_openalex_metadata,
+    "semantic_scholar": get_semantic_scholar_metadata,
+    "pubmed": get_pubmed_metadata,
+    "openaire": get_openaire_metadata,
+    "doaj": get_doaj_metadata,
+    "dryad": get_dryad_metadata,
+    "internetarchive": get_internetarchive_metadata,
+    "wikidata": get_wikidata_metadata,
+    "google_books": get_google_books_metadata,
+    "plos": get_plos_pdf_and_metadata,
+    "openaire": get_openaire_pdf_and_metadata,
+    "doaj": get_doaj_metadata_and_pdf,
+}
+
+def check_and_increment_google_books() -> bool:
+    return True
+
 @app.post("/api/search")
 async def search(data: dict):
     doi = data.get("doi")
@@ -947,151 +1709,122 @@ async def search(data: dict):
         raise HTTPException(status_code=400, detail="DOI is required")
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-
-            # PDF fetchers list (independent) - Removed CORE
-            pdf_tasks = [
-                get_pdf_url_from_doi(doi, client),
-                get_unpaywall_pdf(doi, client),
-                get_europepmc_pdf(doi, client),
-                get_base_pdf(doi, client),
-                get_zenodo_pdf(doi, client),
-                get_figshare_pdf(doi, client),
-                get_europepmc_preprints_pdf(doi, client),
-                get_arxiv_pdf(doi, client),
-                get_biorxiv_pdf(doi, client),
-                get_medrxiv_pdf(doi, client),
-                get_internetarchive_pdf(doi, client),
-            ]
-
-            # Metadata fetchers list (may also contain PDF) - Removed CORE
-            metadata_tasks = [
-                get_crossref_metadata(doi, client),
-                get_openalex_metadata(doi, client),
-                get_semantic_scholar_metadata(doi, client),
-                get_openaire_metadata(doi, client),
-                get_openaire_pdf_and_metadata(doi, client),
-                get_doaj_metadata_and_pdf(doi, client),
-                get_crossref_event_metadata(doi, client),
-                get_nlm_pubmed_metadata(doi, client),
-                get_dryad_metadata(doi, client),
-                get_internetarchive_metadata(doi, client),
-                get_europepmc_grants_metadata(doi, client),
-                get_wikidata_metadata(doi, client),
-                get_google_books_metadata(doi, client),
-                get_plos_pdf_and_metadata(doi, client),
-            ]
-
-            # Create asyncio tasks
-            pdf_tasks = [asyncio.create_task(t) for t in pdf_tasks]
-            metadata_tasks = [asyncio.create_task(t) for t in metadata_tasks]
-
-            pdf_result = None
-            metadata = None
-
-            # 1️⃣ Wait for first PDF from independent fetchers
-            while pdf_tasks:
-                done, pending = await asyncio.wait(pdf_tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    try:
-                        result = task.result()
-                    except Exception:
-                        result = None
-
-                    if result and result.get("pdf_url"):
-                        pdf_result = {**result, "independent": True}  # mark as independent
-                        # cancel remaining independent PDF tasks
-                        for t in pending:
-                            t.cancel()
-                        pdf_tasks = []
-                        break
-
-                pdf_tasks = [t for t in pending if not t.cancelled()]
-                if pdf_result:
+        # Use the shared client from app state
+        client = app.state.client
+        
+        # Create a semaphore to limit concurrent requests
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        
+        async def limited_fetch(source_name, fetch_func, *args, **kwargs):
+            async with semaphore:
+                return await fetch_func(*args, **kwargs)
+        
+        # Create tasks for PDF sources in priority order
+        pdf_tasks = []
+        for source in PDF_SOURCES_PRIORITY:
+            if source in PDF_SOURCE_FUNCTIONS:
+                task = asyncio.create_task(
+                    limited_fetch(source, PDF_SOURCE_FUNCTIONS[source], doi, client)
+                )
+                pdf_tasks.append((source, task))
+        
+        # Create tasks for metadata sources in priority order
+        metadata_tasks = []
+        for source in METADATA_SOURCES_PRIORITY:
+            if source in METADATA_SOURCE_FUNCTIONS:
+                task = asyncio.create_task(
+                    limited_fetch(source, METADATA_SOURCE_FUNCTIONS[source], doi, client)
+                )
+                metadata_tasks.append((source, task))
+        
+        pdf_result = None
+        metadata = None
+        
+        # Process PDF sources in priority order with early termination
+        for source_name, task in pdf_tasks:
+            try:
+                result = await task
+                if result and result.get("pdf_url"):
+                    pdf_result = {
+                        "pdf_url": result["pdf_url"],
+                        "host_type": result.get("host_type", source_name),
+                        "source": result.get("source", source_name),
+                    }
+                    print(f"[Found PDF] from {source_name}: {pdf_result['pdf_url']}")
                     break
-
-            # 2️⃣ Give metadata tasks 4s to finish if PDF found
-            if pdf_result:
+            except Exception as e:
+                print(f"[{source_name}] Error: {e}")
+        
+        # Cancel remaining PDF tasks if we found a PDF
+        if pdf_result:
+            for _, task in pdf_tasks:
+                if not task.done():
+                    task.cancel()
+        
+        # Process metadata sources with a timeout
+        try:
+            # Wait for first metadata source to complete
+            done, pending = await asyncio.wait(
+                [task for _, task in metadata_tasks],
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=3.0  # Short timeout for first result
+            )
+            
+            # Get the first result
+            for task in done:
                 try:
-                    done, pending = await asyncio.wait(metadata_tasks, timeout=4)
-                    for task in done:
-                        try:
-                            result = task.result()
-                        except Exception:
-                            result = None
-
-                        if result:
-                            if result.get("source") == "crossref_event":
-                                continue
-
-                            # Merge metadata
-                            if isinstance(result, dict) and "metadata" in result:
-                                metadata = merge_metadata(metadata, result["metadata"])
-                                # Merge PDF from metadata only if no independent PDF
-                                if result.get("pdf_url") and not pdf_result.get("independent"):
-                                    pdf_result = {
-                                        "pdf_url": result["pdf_url"],
-                                        "host_type": result.get("host_type"),
-                                        "source": result.get("source"),
-                                        "independent": False,
-                                    }
-                            elif result.get("title") and not metadata:
-                                metadata = result
-                            elif result.get("pdf_url") and not pdf_result.get("independent"):
-                                pdf_result = {
-                                    "pdf_url": result["pdf_url"],
-                                    "host_type": result.get("host_type"),
-                                    "source": result.get("source"),
-                                    "independent": False,
-                                }
-                    for t in pending:
-                        t.cancel()
-                except asyncio.TimeoutError:
-                    metadata = None
-            else:
-                # If no independent PDF found → still try metadata fully (6s)
-                done, pending = await asyncio.wait(metadata_tasks, timeout=6)
+                    result = task.result()
+                    if result:
+                        metadata = result
+                        break
+                except Exception:
+                    pass
+            
+            # Cancel remaining tasks
+            for task in pending:
+                task.cancel()
+            
+            # If no metadata yet, wait a bit longer for any source
+            if not metadata:
+                done, pending = await asyncio.wait(
+                    [task for _, task in metadata_tasks if not task.done()],
+                    timeout=2.0  # Additional timeout
+                )
+                
                 for task in done:
                     try:
                         result = task.result()
-                    except Exception:
-                        result = None
-                    if result and result.get("source") != "crossref_event":
-                        if isinstance(result, dict) and "metadata" in result:
-                            metadata = merge_metadata(metadata, result["metadata"])
-                            if result.get("pdf_url") and not pdf_result:
-                                pdf_result = {
-                                    "pdf_url": result["pdf_url"],
-                                    "host_type": result.get("host_type"),
-                                    "source": result.get("source"),
-                                    "independent": False,
-                                }
-                        elif result.get("title") and not metadata:
+                        if result:
                             metadata = result
-                        elif result.get("pdf_url") and not pdf_result:
-                            pdf_result = {
-                                "pdf_url": result["pdf_url"],
-                                "host_type": result.get("host_type"),
-                                "source": result.get("source"),
-                                "independent": False,
-                            }
-                for t in pending:
-                    t.cancel()
-
-            # Fallback metadata
-            if metadata is None:
-                metadata = {}
-                no_meta_message = "No metadata found"
-            else:
-                no_meta_message = None
-
-            title = metadata.get("title", "Unknown Title")
-            authors = metadata.get("authors", [])
-            author_name = "Unknown"
-            if authors and isinstance(authors, list) and isinstance(authors[0], dict):
-                author_name = authors[0].get("name", "Unknown")
-
-
+                            break
+                    except Exception:
+                        pass
+                
+                # Cancel any remaining tasks
+                for task in pending:
+                    task.cancel()
+        except asyncio.TimeoutError:
+            # Cancel all tasks if timeout occurs
+            for _, task in metadata_tasks:
+                if not task.done():
+                    task.cancel()
+        
+        # Fallback metadata
+        if metadata is None:
+            metadata = {}
+            no_meta_message = "No metadata found"
+        else:
+            no_meta_message = None
+        
+        title = metadata.get("title", "Unknown Title")
+        authors = metadata.get("authors", [])
+        author_name = "Unknown"
+        if authors and isinstance(authors, list) and isinstance(authors[0], dict):
+            author_name = authors[0].get("name", "Unknown")
+        
+        # Clean up memory
+        gc.collect()
+        
         if pdf_result:
             return {
                 "message": "Paper found!" if metadata else no_meta_message,
