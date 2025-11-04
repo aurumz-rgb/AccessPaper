@@ -268,6 +268,9 @@ async def get_semantic_scholar_metadata(doi: str, client: httpx.AsyncClient) -> 
             "journal": data.get("journal", {}).get("name"),
             "year": data.get("year")
         }
+    except httpx.HTTPStatusError as e:
+        print(f"[Semantic Scholar] HTTP error: {e}")
+        return None
     except Exception as e:
         print(f"[Semantic Scholar] metadata fetch error: {e}")
         return None
@@ -441,6 +444,9 @@ async def get_google_books_metadata(doi: str, client: httpx.AsyncClient) -> Opti
         }
         print(f"[Google Books] Metadata fetched: {metadata}")
         return metadata
+    except httpx.HTTPStatusError as e:
+        print(f"[Google Books] HTTP error: {e}")
+        return None
     except Exception as e:
         print(f"[Google Books] Fetch error: {e}")
         return None
@@ -597,6 +603,8 @@ async def get_base_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
                             return {"pdf_url": direct_pdf, "host_type": "BASE", "source": "BASE"}
 
         print("[BASE] No valid PDF link found in response")
+    except httpx.HTTPStatusError as e:
+        print(f"[BASE] HTTP error: {e}")
     except Exception as e:
         print(f"[BASE] PDF fetch error: {e}")
 
@@ -638,6 +646,8 @@ async def get_figshare_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict
                         print(f"[Figshare] PDF URL found: {download_url}")
                         return {"pdf_url": download_url, "host_type": "Figshare", "source": "Figshare"}
         print("[Figshare] No valid PDF link found")
+    except httpx.HTTPStatusError as e:
+        print(f"[Figshare] HTTP error: {e}")
     except Exception as e:
         print(f"[Figshare] PDF fetch error: {e}")
     return None
@@ -1548,6 +1558,8 @@ async def get_openaire_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> 
                         }
                         return {"pdf_url": direct_pdf, "host_type": "OpenAIRE", "source": "OpenAIRE", "metadata": metadata}
         print("[OpenAIRE] No valid PDF found")
+    except httpx.HTTPStatusError as e:
+        print(f"[OpenAIRE] HTTP error: {e}")
     except Exception as e:
         print(f"[OpenAIRE] PDF fetch error: {e}")
     return None
@@ -1717,7 +1729,14 @@ async def search(data: dict):
         
         async def limited_fetch(source_name, fetch_func, *args, **kwargs):
             async with semaphore:
-                return await fetch_func(*args, **kwargs)
+                try:
+                    return await fetch_func(*args, **kwargs)
+                except asyncio.CancelledError:
+                    print(f"[{source_name}] Task cancelled")
+                    return None
+                except Exception as e:
+                    print(f"[{source_name}] Error: {e}")
+                    return None
         
         # Create tasks for PDF sources in priority order
         pdf_tasks = []
@@ -1760,6 +1779,10 @@ async def search(data: dict):
             for _, task in pdf_tasks:
                 if not task.done():
                     task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
         
         # Process metadata sources with a timeout
         try:
@@ -1783,6 +1806,10 @@ async def search(data: dict):
             # Cancel remaining tasks
             for task in pending:
                 task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             
             # If no metadata yet, wait a bit longer for any source
             if not metadata:
@@ -1803,11 +1830,19 @@ async def search(data: dict):
                 # Cancel any remaining tasks
                 for task in pending:
                     task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
         except asyncio.TimeoutError:
             # Cancel all tasks if timeout occurs
             for _, task in metadata_tasks:
                 if not task.done():
                     task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
         
         # Fallback metadata
         if metadata is None:
