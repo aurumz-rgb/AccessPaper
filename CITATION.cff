@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it using the following metadata."
 title: "AccessPaper: Instant Free Legal Full‑text Research Article Finder"
 version: "v2.0.0"
-doi: "https://doi.org/10.5281/zenodo.XXXXX"  
+doi: "http://doi.org/10.6084/m9.figshare.30530423"  
 date-released: 2025‑11‑04
 authors:
   - family-names: "Sahu"
@@ -14,6 +14,6 @@ preferred-citation:
       given-names: "Vihaan"
   title: "AccessPaper: Instant Free Legal Full‑text Research Article Finder"
   version: "v2.0.0"
-  doi: "https://doi.org/10.5281/zenodo.XXXXX"
+  doi: "http://doi.org/10.6084/m9.figshare.30530423"
   year: 2025
   url: "https://accesspaper.vercel.app/"

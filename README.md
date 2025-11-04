@@ -72,8 +72,7 @@
 
 This project has been cited just for future reference and for maintaining an Archive.
 
-> **Sahu, V. (2025). *Critiplot: A Python based Package for risk-of-bias data visualization in Systematic Reviews & Meta-Analysis* (v1.0.2). Zenodo. [https://doi.org/10.5281/zenodo.17338087](https://doi.org/10.5281/zenodo.17338087)**
-(temporary citation dummy)
+> **Sahu, Vihaan (2025). AccessPaper: Instant Free Legal Full‑text Research Article Finder. figshare. Software. https://doi.org/10.6084/m9.figshare.30530423.v1**
 
 ---
 
