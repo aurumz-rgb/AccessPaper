@@ -1786,38 +1786,18 @@ async def search(data: dict):
         
         # Process metadata sources with a timeout
         try:
-            # Wait for first metadata source to complete
-            done, pending = await asyncio.wait(
-                [task for _, task in metadata_tasks],
-                return_when=asyncio.FIRST_COMPLETED,
-                timeout=3.0  # Short timeout for first result
-            )
+            # Get a list of active metadata tasks
+            active_metadata_tasks = [task for _, task in metadata_tasks if not task.done()]
             
-            # Get the first result
-            for task in done:
-                try:
-                    result = task.result()
-                    if result:
-                        metadata = result
-                        break
-                except Exception:
-                    pass
-            
-            # Cancel remaining tasks
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            
-            # If no metadata yet, wait a bit longer for any source
-            if not metadata:
+            if active_metadata_tasks:
+                # Wait for first metadata source to complete
                 done, pending = await asyncio.wait(
-                    [task for _, task in metadata_tasks if not task.done()],
-                    timeout=2.0  # Additional timeout
+                    active_metadata_tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=3.0  # Short timeout for first result
                 )
                 
+                # Get the first result
                 for task in done:
                     try:
                         result = task.result()
@@ -1827,22 +1807,43 @@ async def search(data: dict):
                     except Exception:
                         pass
                 
-                # Cancel any remaining tasks
+                # Cancel remaining tasks
                 for task in pending:
                     task.cancel()
                     try:
                         await task
                     except asyncio.CancelledError:
                         pass
-        except asyncio.TimeoutError:
-            # Cancel all tasks if timeout occurs
-            for _, task in metadata_tasks:
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+                
+                # If no metadata yet, wait a bit longer for any source
+                if not metadata:
+                    # Get a list of still active tasks
+                    still_active_tasks = [task for _, task in metadata_tasks if not task.done()]
+                    
+                    if still_active_tasks:
+                        done, pending = await asyncio.wait(
+                            still_active_tasks,
+                            timeout=2.0  # Additional timeout
+                        )
+                        
+                        for task in done:
+                            try:
+                                result = task.result()
+                                if result:
+                                    metadata = result
+                                    break
+                            except Exception:
+                                pass
+                        
+                        # Cancel any remaining tasks
+                        for task in pending:
+                            task.cancel()
+                            try:
+                                await task
+                            except asyncio.CancelledError:
+                                pass
+        except Exception as e:
+            print(f"[Search API Error] {e}")
         
         # Fallback metadata
         if metadata is None:
