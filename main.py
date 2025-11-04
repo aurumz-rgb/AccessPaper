@@ -17,7 +17,6 @@ load_dotenv()
 REQUEST_TIMEOUT = 5 # seconds
 
 BASE_API_ENABLED = os.getenv("BASE_API_ENABLED") 
-CORE_API_KEY = os.getenv("CORE_API_KEY", "")
 GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY", "")
 UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", "email@example.com")
 
@@ -83,6 +82,59 @@ def quote(text: Optional[str]) -> str:
     return url_quote(text or "")
 
 
+async def verify_pdf_url(url: str, client: httpx.AsyncClient) -> bool:
+    """
+    Verify that a URL is a direct PDF download link
+    """
+    try:
+        head_response = await client.head(url, timeout=REQUEST_TIMEOUT)
+        content_type = head_response.headers.get("content-type", "").lower()
+        content_disposition = head_response.headers.get("content-disposition", "").lower()
+        
+        # Check if it's a PDF by content type or content disposition
+        if "pdf" in content_type or "pdf" in content_disposition or url.lower().endswith(".pdf"):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+async def extract_pdf_from_page(page_url: str, client: httpx.AsyncClient) -> Optional[str]:
+    """
+    Try to extract a direct PDF link from a web page
+    """
+    try:
+        response = await client.get(page_url, timeout=REQUEST_TIMEOUT)
+        content = response.text
+        
+        # Common patterns for PDF links
+        patterns = [
+            r'href=["\']([^"\']*\.pdf)["\']',
+            r'["\']([^"\']*\.pdf)["\']',
+            r'href=["\']([^"\']*\?download=1)["\']',
+            r'href=["\']([^"\']*\/download)["\']',
+        ]
+        
+        import re
+        for pattern in patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            for match in matches:
+                if match.startswith("/"):
+                    # Convert relative URL to absolute
+                    base_url = page_url.split("/")[0] + "//" + page_url.split("/")[2]
+                    match = base_url + match
+                elif not match.startswith("http"):
+                    # Convert relative URL to absolute
+                    base_url = page_url.rsplit("/", 1)[0]
+                    match = base_url + "/" + match
+                
+                # Verify it's a PDF
+                if await verify_pdf_url(match, client):
+                    return match
+        
+        return None
+    except Exception:
+        return None
 
 
 async def get_crossref_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
@@ -131,13 +183,25 @@ async def get_pdf_url_from_doi(doi: str, client: httpx.AsyncClient) -> Dict[str,
         content_type = resp.headers.get("content-type", "").lower()
 
         if final_url.lower().endswith(".pdf") or "pdf" in content_type:
-            result["pdf_url"] = final_url
+            # Verify it's a direct PDF
+            if await verify_pdf_url(final_url, client):
+                result["pdf_url"] = final_url
+            else:
+                result["publisher_url"] = final_url
         else:
             result["publisher_url"] = final_url
 
         # Optional: handle PMC / arXiv if needed
         if "arxiv.org" in final_url and "/abs/" in final_url:
-            result["pdf_url"] = final_url.replace("/abs/", "/pdf/") + ".pdf"
+            pdf_url = final_url.replace("/abs/", "/pdf/") + ".pdf"
+            if await verify_pdf_url(pdf_url, client):
+                result["pdf_url"] = pdf_url
+        
+        # Try to extract PDF from publisher page if no direct PDF found
+        if not result["pdf_url"] and result["publisher_url"]:
+            pdf_url = await extract_pdf_from_page(result["publisher_url"], client)
+            if pdf_url:
+                result["pdf_url"] = pdf_url
 
     except Exception as e:
         print(f"[PDF Check] Error checking DOI: {e}", flush=True)
@@ -200,98 +264,33 @@ async def get_unpaywall_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dic
         loc = data.get("best_oa_location")
         if loc:
             pdf_url = loc.get("url_for_pdf")
-            if pdf_url:
+            if pdf_url and await verify_pdf_url(pdf_url, client):
                 print(f"[Unpaywall] PDF URL found in best_oa_location: {pdf_url}")
                 return {"pdf_url": pdf_url, "host_type": loc.get("host_type"), "source": "Unpaywall"}
+            elif pdf_url:
+                # Try to extract PDF from the page
+                direct_pdf = await extract_pdf_from_page(pdf_url, client)
+                if direct_pdf:
+                    print(f"[Unpaywall] Direct PDF extracted from page: {direct_pdf}")
+                    return {"pdf_url": direct_pdf, "host_type": loc.get("host_type"), "source": "Unpaywall"}
 
         # If best_oa_location missing or no pdf_url, check all oa_locations
         oa_locations = data.get("oa_locations", [])
         for location in oa_locations:
             pdf_url = location.get("url_for_pdf")
-            if pdf_url:
+            if pdf_url and await verify_pdf_url(pdf_url, client):
                 print(f"[Unpaywall] PDF URL found in oa_locations: {pdf_url}")
                 return {"pdf_url": pdf_url, "host_type": location.get("host_type"), "source": "Unpaywall"}
+            elif pdf_url:
+                # Try to extract PDF from the page
+                direct_pdf = await extract_pdf_from_page(pdf_url, client)
+                if direct_pdf:
+                    print(f"[Unpaywall] Direct PDF extracted from page: {direct_pdf}")
+                    return {"pdf_url": direct_pdf, "host_type": location.get("host_type"), "source": "Unpaywall"}
 
         print("[Unpaywall] No valid PDF link found in any location")
     except Exception as e:
         print(f"[Unpaywall] PDF fetch error: {e}")
-    return None
-
-
-
-async def get_core_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    print(f"[CORE] Fetching PDF for DOI: {doi}")
-    if not CORE_API_KEY:
-        print("[CORE] CORE API key missing, skipping")
-        return None
-    
-    url = f"https://api.core.ac.uk/v3/search/works/?apiKey={CORE_API_KEY}&q=doi:{quote(doi)}"
-    try:
-        r = await client.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = await r.json()
-        results = data.get("results", [])
-        if not results:
-            print("[CORE] No results found")
-            return None
-        
-        for item in results:
-            # Get the CORE ID for direct PDF access
-            core_id = item.get("id")
-            if not core_id:
-                continue
-                
-            # Try direct PDF download URL format
-            direct_pdf_url = f"https://core.ac.uk/download/pdf/{core_id}.pdf"
-            try:
-                head_response = await client.head(direct_pdf_url, timeout=REQUEST_TIMEOUT)
-                if head_response.status_code == 200:
-                    print(f"[CORE] Direct PDF URL found and verified: {direct_pdf_url}")
-                    return {"pdf_url": direct_pdf_url, "host_type": "CORE", "source": "CORE"}
-            except Exception as e:
-                print(f"[CORE] Direct PDF URL verification failed: {e}")
-            
-            # Check for downloadUrl field
-            download_url = item.get("downloadUrl")
-            if download_url:
-                # Verify it's a direct PDF link, not a web page
-                try:
-                    head_response = await client.head(download_url, timeout=REQUEST_TIMEOUT)
-                    content_type = head_response.headers.get("content-type", "").lower()
-                    if "pdf" in content_type or download_url.lower().endswith(".pdf"):
-                        print(f"[CORE] PDF URL found and verified: {download_url}")
-                        return {"pdf_url": download_url, "host_type": "CORE", "source": "CORE"}
-                except Exception as e:
-                    print(f"[CORE] PDF URL verification failed for {download_url}: {e}")
-            
-            # Check fullTextUrl field
-            full_text_url = item.get("fullTextUrl")
-            if full_text_url:
-                # Handle both string and list formats
-                urls_to_check = []
-                if isinstance(full_text_url, list):
-                    urls_to_check = full_text_url
-                else:
-                    urls_to_check = [full_text_url]
-                
-                for url_ in urls_to_check:
-                    if not url_:
-                        continue
-                        
-                    # Verify it's a direct PDF link
-                    try:
-                        head_response = await client.head(url_, timeout=REQUEST_TIMEOUT)
-                        content_type = head_response.headers.get("content-type", "").lower()
-                        if "pdf" in content_type or url_.lower().endswith(".pdf"):
-                            print(f"[CORE] PDF URL found and verified: {url_}")
-                            return {"pdf_url": url_, "host_type": "CORE", "source": "CORE"}
-                    except Exception as e:
-                        print(f"[CORE] PDF URL verification failed for {url_}: {e}")
-                        continue
-        
-        print("[CORE] No valid PDF link found in results")
-    except Exception as e:
-        print(f"[CORE] PDF fetch error: {e}")
     return None
 
 async def get_zenodo_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
@@ -304,7 +303,7 @@ async def get_zenodo_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[s
         for hit in hits:
             for f in hit.get("files", []):
                 pdf_link = f.get("links", {}).get("self", "")
-                if pdf_link.lower().endswith(".pdf"):
+                if pdf_link.lower().endswith(".pdf") and await verify_pdf_url(pdf_link, client):
                     print(f"[Zenodo] PDF URL found: {pdf_link}")
                     return {"pdf_url": pdf_link, "host_type": "Zenodo", "source": "Zenodo"}
         print("[Zenodo] No valid PDF link found")
@@ -324,7 +323,7 @@ async def get_figshare_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict
             for f in item.get("files", []):
                 if f.get("name", "").lower().endswith(".pdf"):
                     download_url = f.get("download_url")
-                    if download_url:
+                    if download_url and await verify_pdf_url(download_url, client):
                         print(f"[Figshare] PDF URL found: {download_url}")
                         return {"pdf_url": download_url, "host_type": "Figshare", "source": "Figshare"}
         print("[Figshare] No valid PDF link found")
@@ -346,8 +345,15 @@ async def get_europepmc_preprints_pdf(doi: str, client: httpx.AsyncClient) -> Op
             for full_text_url in full_text_urls:
                 if full_text_url.get("documentStyle") == "pdf" and full_text_url.get("availability") == "OPEN_ACCESS":
                     pdf_link = full_text_url.get("url")
-                    print(f"[EuropePMC Preprints] PDF URL found: {pdf_link}")
-                    return {"pdf_url": pdf_link, "host_type": "EuropePMC Preprints", "source": "EuropePMC Preprints"}
+                    if await verify_pdf_url(pdf_link, client):
+                        print(f"[EuropePMC Preprints] PDF URL found: {pdf_link}")
+                        return {"pdf_url": pdf_link, "host_type": "EuropePMC Preprints", "source": "EuropePMC Preprints"}
+                    else:
+                        # Try to extract PDF from the page
+                        direct_pdf = await extract_pdf_from_page(pdf_link, client)
+                        if direct_pdf:
+                            print(f"[EuropePMC Preprints] Direct PDF extracted from page: {direct_pdf}")
+                            return {"pdf_url": direct_pdf, "host_type": "EuropePMC Preprints", "source": "EuropePMC Preprints"}
         print("[EuropePMC Preprints] No valid PDF link found")
     except Exception as e:
         print(f"[EuropePMC Preprints] PDF fetch error: {e}")
@@ -371,8 +377,15 @@ async def get_base_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
             for link in record.get("links", []):
                 url_link = link.get("url", "")
                 if link.get("type") == "fulltext" and ".pdf" in url_link.lower(): 
-                    print(f"[BASE] PDF URL found: {url_link}")
-                    return {"pdf_url": url_link, "host_type": "BASE", "source": "BASE"}
+                    if await verify_pdf_url(url_link, client):
+                        print(f"[BASE] PDF URL found: {url_link}")
+                        return {"pdf_url": url_link, "host_type": "BASE", "source": "BASE"}
+                    else:
+                        # Try to extract PDF from the page
+                        direct_pdf = await extract_pdf_from_page(url_link, client)
+                        if direct_pdf:
+                            print(f"[BASE] Direct PDF extracted from page: {direct_pdf}")
+                            return {"pdf_url": direct_pdf, "host_type": "BASE", "source": "BASE"}
 
         print("[BASE] No valid PDF link found in response")
     except Exception as e:
@@ -385,7 +398,7 @@ async def get_base_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str
 
 async def get_openaire_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     print(f"[OpenAIRE] Fetching PDF and metadata for DOI: {doi}")
-    url = f"https://api.openaire.eu/search/publications?doi={quote(doi)}&format=json"
+    url = f"https://api.openaire.eu/search/publications?doi:{quote(doi)}&format=json"
     try:
         r = await client.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
@@ -399,15 +412,29 @@ async def get_openaire_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> 
         for ft in fulltexts:
             if "url" in ft and ft.get("mediaType", "").lower() == "application/pdf":
                 pdf_url = ft["url"]
-                print(f"[OpenAIRE] PDF URL found: {pdf_url}")
-                metadata = {
-                    "title": pub.get("result", {}).get("title"),
-                    "authors": [{"name": a.get("name")} for a in pub.get("result", {}).get("creators", [])],
-                    "corresponding_email": None,
-                    "journal": pub.get("result", {}).get("publisher"),
-                    "year": pub.get("result", {}).get("publicationYear"),
-                }
-                return {"pdf_url": pdf_url, "host_type": "OpenAIRE", "source": "OpenAIRE", "metadata": metadata}
+                if await verify_pdf_url(pdf_url, client):
+                    print(f"[OpenAIRE] PDF URL found: {pdf_url}")
+                    metadata = {
+                        "title": pub.get("result", {}).get("title"),
+                        "authors": [{"name": a.get("name")} for a in pub.get("result", {}).get("creators", [])],
+                        "corresponding_email": None,
+                        "journal": pub.get("result", {}).get("publisher"),
+                        "year": pub.get("result", {}).get("publicationYear"),
+                    }
+                    return {"pdf_url": pdf_url, "host_type": "OpenAIRE", "source": "OpenAIRE", "metadata": metadata}
+                else:
+                    # Try to extract PDF from the page
+                    direct_pdf = await extract_pdf_from_page(pdf_url, client)
+                    if direct_pdf:
+                        print(f"[OpenAIRE] Direct PDF extracted from page: {direct_pdf}")
+                        metadata = {
+                            "title": pub.get("result", {}).get("title"),
+                            "authors": [{"name": a.get("name")} for a in pub.get("result", {}).get("creators", [])],
+                            "corresponding_email": None,
+                            "journal": pub.get("result", {}).get("publisher"),
+                            "year": pub.get("result", {}).get("publicationYear"),
+                        }
+                        return {"pdf_url": direct_pdf, "host_type": "OpenAIRE", "source": "OpenAIRE", "metadata": metadata}
         print("[OpenAIRE] No valid PDF found")
     except Exception as e:
         print(f"[OpenAIRE] PDF fetch error: {e}")
@@ -432,15 +459,29 @@ async def get_doaj_metadata_and_pdf(doi: str, client: httpx.AsyncClient) -> Opti
                 pdf_url = link["url"]
                 break
         if pdf_url:
-            print(f"[DOAJ] PDF URL found: {pdf_url}")
-            metadata = {
-                "title": article.get("title"),
-                "authors": [{"name": a.get("name")} for a in article.get("author", [])],
-                "corresponding_email": None,
-                "journal": article.get("journal", {}).get("title"),
-                "year": article.get("year"),
-            }
-            return {"pdf_url": pdf_url, "host_type": "DOAJ", "source": "DOAJ", "metadata": metadata}
+            if await verify_pdf_url(pdf_url, client):
+                print(f"[DOAJ] PDF URL found: {pdf_url}")
+                metadata = {
+                    "title": article.get("title"),
+                    "authors": [{"name": a.get("name")} for a in article.get("author", [])],
+                    "corresponding_email": None,
+                    "journal": article.get("journal", {}).get("title"),
+                    "year": article.get("year"),
+                }
+                return {"pdf_url": pdf_url, "host_type": "DOAJ", "source": "DOAJ", "metadata": metadata}
+            else:
+                # Try to extract PDF from the page
+                direct_pdf = await extract_pdf_from_page(pdf_url, client)
+                if direct_pdf:
+                    print(f"[DOAJ] Direct PDF extracted from page: {direct_pdf}")
+                    metadata = {
+                        "title": article.get("title"),
+                        "authors": [{"name": a.get("name")} for a in article.get("author", [])],
+                        "corresponding_email": None,
+                        "journal": article.get("journal", {}).get("title"),
+                        "year": article.get("year"),
+                    }
+                    return {"pdf_url": direct_pdf, "host_type": "DOAJ", "source": "DOAJ", "metadata": metadata}
         print("[DOAJ] No PDF found")
     except Exception as e:
         print(f"[DOAJ] Fetch error: {e}")
@@ -663,96 +704,6 @@ async def get_dryad_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Di
 
 
 
-# 5. CORE Text Mining Metadata + PDF (API key required)
-async def get_core_pdf_and_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    if not CORE_API_KEY:
-        print("[CORE] API key missing, skipping")
-        return None
-    url = f"https://api.core.ac.uk/v3/search/works?query=doi:{quote(doi)}"
-    headers = {"Authorization": f"Bearer {CORE_API_KEY}"}
-    try:
-        r = await client.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        docs = data.get("results", [])
-        if not docs:
-            return None
-        doc = docs[0]
-        
-        # Get the CORE ID for direct PDF access
-        core_id = doc.get("id")
-        
-        # Extract metadata
-        metadata = {
-            "title": doc.get("title"),
-            "authors": [{"name": a.get("name")} for a in doc.get("authors", [])],
-            "journal": doc.get("journal", {}).get("title") if doc.get("journal") else None,
-            "year": doc.get("yearPublished"),
-            "abstract": doc.get("abstract"),
-        }
-        
-        result = {"metadata": metadata}
-        pdf_url = None
-        
-        # Try direct PDF download URL format first
-        if core_id:
-            direct_pdf_url = f"https://core.ac.uk/download/pdf/{core_id}.pdf"
-            try:
-                head_response = await client.head(direct_pdf_url, timeout=REQUEST_TIMEOUT)
-                if head_response.status_code == 200:
-                    pdf_url = direct_pdf_url
-                    print(f"[CORE] Direct PDF URL found and verified: {direct_pdf_url}")
-            except Exception as e:
-                print(f"[CORE] Direct PDF URL verification failed: {e}")
-        
-        # If direct URL didn't work, try other fields
-        if not pdf_url:
-            # Check downloadUrl field
-            download_url = doc.get("downloadUrl")
-            if download_url:
-                try:
-                    head_response = await client.head(download_url, timeout=REQUEST_TIMEOUT)
-                    content_type = head_response.headers.get("content-type", "").lower()
-                    if "pdf" in content_type or download_url.lower().endswith(".pdf"):
-                        pdf_url = download_url
-                        print(f"[CORE] PDF URL found and verified: {download_url}")
-                except Exception as e:
-                    print(f"[CORE] PDF URL verification failed for {download_url}: {e}")
-            
-            # Check fullTextUrl field
-            if not pdf_url:
-                full_text_url = doc.get("fullTextUrl")
-                if full_text_url:
-                    urls_to_check = []
-                    if isinstance(full_text_url, list):
-                        urls_to_check = full_text_url
-                    else:
-                        urls_to_check = [full_text_url]
-                    
-                    for url_ in urls_to_check:
-                        if not url_:
-                            continue
-                            
-                        try:
-                            head_response = await client.head(url_, timeout=REQUEST_TIMEOUT)
-                            content_type = head_response.headers.get("content-type", "").lower()
-                            if "pdf" in content_type or url_.lower().endswith(".pdf"):
-                                pdf_url = url_
-                                print(f"[CORE] PDF URL found and verified: {url_}")
-                                break
-                        except Exception as e:
-                            print(f"[CORE] PDF URL verification failed for {url_}: {e}")
-                            continue
-        
-        if pdf_url:
-            result.update({"pdf_url": pdf_url, "host_type": "CORE", "source": "CORE"})
-        
-        return result
-    except Exception as e:
-        print(f"[CORE] Fetch error: {e}")
-        return None
-
-
 # 6. OpenAIRE Datasets/Projects Metadata (no key)
 async def get_openaire_metadata(doi: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     print(f"[OpenAIRE] Fetching metadata for DOI: {doi}")
@@ -901,13 +852,25 @@ async def get_europepmc_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dic
             for full_text_url in full_text_urls:
                 if full_text_url.get("documentStyle") == "pdf" and full_text_url.get("availability") == "OPEN_ACCESS":
                     pdf_link = full_text_url.get("url")
-                    host_type = (
-                        "EuropePMC Preprints"
-                        if result.get("pubType", "").lower() == "preprint"
-                        else "EuropePMC"
-                    )
-                    print(f"[EuropePMC] PDF URL found: {pdf_link} (Type: {host_type})")
-                    return {"pdf_url": pdf_link, "host_type": host_type, "source": host_type}
+                    if await verify_pdf_url(pdf_link, client):
+                        host_type = (
+                            "EuropePMC Preprints"
+                            if result.get("pubType", "").lower() == "preprint"
+                            else "EuropePMC"
+                        )
+                        print(f"[EuropePMC] PDF URL found: {pdf_link} (Type: {host_type})")
+                        return {"pdf_url": pdf_link, "host_type": host_type, "source": host_type}
+                    else:
+                        # Try to extract PDF from the page
+                        direct_pdf = await extract_pdf_from_page(pdf_link, client)
+                        if direct_pdf:
+                            host_type = (
+                                "EuropePMC Preprints"
+                                if result.get("pubType", "").lower() == "preprint"
+                                else "EuropePMC"
+                            )
+                            print(f"[EuropePMC] Direct PDF extracted from page: {direct_pdf} (Type: {host_type})")
+                            return {"pdf_url": direct_pdf, "host_type": host_type, "source": host_type}
 
         print("[EuropePMC] No valid PDF link found")
     except Exception as e:
@@ -936,23 +899,41 @@ async def get_share_pdf(doi: str, client: httpx.AsyncClient) -> Optional[Dict[st
             sources = attrs.get('sources', [])
             for source in sources:
                 url = source.get('url')
-                if url and url.lower().endswith('.pdf'):
+                if url and url.lower().endswith('.pdf') and await verify_pdf_url(url, client):
                     print(f"[Share API] PDF URL found in sources: {url}")
                     return {"pdf_url": url, "host_type": "Share API", "source": "Share"}
+                elif url and url.lower().endswith('.pdf'):
+                    # Try to extract PDF from the page
+                    direct_pdf = await extract_pdf_from_page(url, client)
+                    if direct_pdf:
+                        print(f"[Share API] Direct PDF extracted from sources: {direct_pdf}")
+                        return {"pdf_url": direct_pdf, "host_type": "Share API", "source": "Share"}
 
             # Check 'fulltext' field
             fulltext_url = attrs.get('fulltext')
-            if fulltext_url and fulltext_url.lower().endswith('.pdf'):
+            if fulltext_url and fulltext_url.lower().endswith('.pdf') and await verify_pdf_url(fulltext_url, client):
                 print(f"[Share API] PDF URL found in fulltext: {fulltext_url}")
                 return {"pdf_url": fulltext_url, "host_type": "Share API", "source": "Share"}
+            elif fulltext_url and fulltext_url.lower().endswith('.pdf'):
+                # Try to extract PDF from the page
+                direct_pdf = await extract_pdf_from_page(fulltext_url, client)
+                if direct_pdf:
+                    print(f"[Share API] Direct PDF extracted from fulltext: {direct_pdf}")
+                    return {"pdf_url": direct_pdf, "host_type": "Share API", "source": "Share"}
 
             # Check 'links' dictionary
             links = attrs.get('links', {})
             for key in ['pdf', 'html']:
                 link_url = links.get(key)
-                if link_url and link_url.lower().endswith('.pdf'):
+                if link_url and link_url.lower().endswith('.pdf') and await verify_pdf_url(link_url, client):
                     print(f"[Share API] PDF URL found in links[{key}]: {link_url}")
                     return {"pdf_url": link_url, "host_type": "Share API", "source": "Share"}
+                elif link_url and link_url.lower().endswith('.pdf'):
+                    # Try to extract PDF from the page
+                    direct_pdf = await extract_pdf_from_page(link_url, client)
+                    if direct_pdf:
+                        print(f"[Share API] Direct PDF extracted from links[{key}]: {direct_pdf}")
+                        return {"pdf_url": direct_pdf, "host_type": "Share API", "source": "Share"}
 
         print("[Share API] No valid PDF link found")
     except Exception as e:
@@ -968,7 +949,7 @@ async def search(data: dict):
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
 
-            # PDF fetchers list (independent)
+            # PDF fetchers list (independent) - Removed CORE
             pdf_tasks = [
                 get_pdf_url_from_doi(doi, client),
                 get_unpaywall_pdf(doi, client),
@@ -981,10 +962,9 @@ async def search(data: dict):
                 get_biorxiv_pdf(doi, client),
                 get_medrxiv_pdf(doi, client),
                 get_internetarchive_pdf(doi, client),
-                get_core_pdf(doi, client),
             ]
 
-            # Metadata fetchers list (may also contain PDF)
+            # Metadata fetchers list (may also contain PDF) - Removed CORE
             metadata_tasks = [
                 get_crossref_metadata(doi, client),
                 get_openalex_metadata(doi, client),
@@ -999,7 +979,6 @@ async def search(data: dict):
                 get_europepmc_grants_metadata(doi, client),
                 get_wikidata_metadata(doi, client),
                 get_google_books_metadata(doi, client),
-                get_core_pdf_and_metadata(doi, client),
                 get_plos_pdf_and_metadata(doi, client),
             ]
 
