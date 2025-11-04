@@ -70,7 +70,7 @@
 
 ## Citation
 
-If you use this software, please cite it using the following metadata:
+This project has been cited just for future reference and for maintaining an Archive.
 
 > **Sahu, V. (2025). *Critiplot: A Python based Package for risk-of-bias data visualization in Systematic Reviews & Meta-Analysis* (v1.0.2). Zenodo. [https://doi.org/10.5281/zenodo.17338087](https://doi.org/10.5281/zenodo.17338087)**
 (temporary citation dummy)
